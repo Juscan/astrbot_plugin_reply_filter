@@ -91,16 +91,16 @@
     "hint": "1～10000。保护的URL/邮箱/数字不会被拆坏；natural/custom还保护完整字素和常见颜文字。原子或max_messages合并尾部时可超过此软长度。"
   },
   "max_messages": {
-    "description": "单条LLM回复最多几个发送组",
+    "description": "文本段数量软上限（保留所有附件）",
     "type": "int",
     "default": 10,
-    "hint": "1～50。多出的片段合并到最后一组，不截断内容；平台可能进一步拆发文件/转发，超大回退消息仍可能超过OneBot端限制。"
+    "hint": "1～50。达到上限后仅合并相邻文本段，不跨图片/表情/文件等组件合并或删附件；因此可超过上限。实际气泡数由AstrBot核心分段和协议端决定。"
   },
   "send_interval": {
-    "description": "同一回复的发送间隔（秒）",
+    "description": "旧版发送间隔（已弃用，仅兼容保存）",
     "type": "float",
     "default": 0.6,
-    "hint": "0～10。相同会话在本插件内顺序发送；不能保证平台不触发风控。"
+    "hint": "0～10，1.1.1起不再控制发送。为保留表情插件的发送后钩子，交由AstrBot正常发送；请在核心segmented_reply中设置interval_method=random、interval=0.6,0.6。"
   },
   "render_timeout": {
     "description": "每次渲染总超时（秒）",

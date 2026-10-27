@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from weakref import WeakValueDictionary
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .processing import (
     Settings,
-    cap_messages,
     clean_text,
     fallback_chunks,
     markdown_probe,
@@ -26,7 +24,7 @@ from .storage import save_pdf
 
 @register(
     "astrbot_plugin_reply_filter", "Jusc",
-    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.0",
+    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.1",
 )
 class ReplyFilterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -35,14 +33,6 @@ class ReplyFilterPlugin(Star):
         self.renderer = BrowserRenderer(context, self.settings)
         self.cache_dir = Path(StarTools.get_data_dir("astrbot_plugin_reply_filter")) / "pdf"
         self._cache_lock = asyncio.Lock()
-        self._session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
-
-    def _session_lock(self, session: str) -> asyncio.Lock:
-        lock = self._session_locks.get(session)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_locks[session] = lock
-        return lock
 
     async def _render_component(self, text: str, kind: str):
         # A whole-operation deadline includes queue wait in the shared service.
@@ -61,7 +51,13 @@ class ReplyFilterPlugin(Star):
 
     async def _text_components(self, text: str, kind: str | None) -> list:
         if kind is None:
-            return [Comp.Plain(text=value) for value in split_short_text(text, self.settings)]
+            values = split_short_text(text, self.settings)
+            # Keep paragraph breaks when core segmented replies are disabled.
+            # With core segmentation these are just trailing line breaks.
+            return [
+                Comp.Plain(text=value + ("\n" if index < len(values) - 1 else ""))
+                for index, value in enumerate(values)
+            ]
         if len(text) <= self.settings.max_render_chars:
             try:
                 return [await self._render_component(text, kind)]
@@ -114,22 +110,23 @@ class ReplyFilterPlugin(Star):
                 prepared.append(run)
         return prepared
 
-    def _delivery_groups(self, prepared: list) -> list[list]:
-        messages: list[list] = []
-        headers: list = []
+    def _cap_text_segments(self, prepared: list) -> list:
+        """Soft-limit Plain segments without moving or discarding attachments."""
+        capped: list = []
+        text_count = 0
         for component in prepared:
-            if isinstance(component, (Comp.At, Comp.Reply)):
-                headers.append(component)
-            else:
-                messages.append([*headers, component])
-                headers.clear()
-        if headers and messages:
-            messages[-1].extend(headers)
-        # A mention/reply-only chain is not a deliverable OneBot message.
-        return [
-            [component for message in group for component in message]
-            for group in cap_messages(messages, self.settings.max_messages)
-        ]
+            if isinstance(component, Comp.Plain):
+                if (
+                    text_count >= self.settings.max_messages
+                    and capped and isinstance(capped[-1], Comp.Plain)
+                ):
+                    # Short segments already include newlines; fallback chunks
+                    # must concatenate verbatim to preserve Markdown and code.
+                    capped[-1].text += component.text
+                    continue
+                text_count += 1
+            capped.append(component)
+        return capped
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10000)
     async def request_non_streaming(self, event: AstrMessageEvent) -> None:
@@ -141,7 +138,7 @@ class ReplyFilterPlugin(Star):
             # Live Mode, and another plugin can intentionally override it later.
             event.set_extra("enable_streaming", False)
 
-    @filter.on_decorating_result()
+    @filter.on_decorating_result(priority=100000)
     async def filter_reply(self, event: AstrMessageEvent) -> None:
         if not self.settings.enabled or event.get_platform_name() != "aiocqhttp":
             return
@@ -152,35 +149,37 @@ class ReplyFilterPlugin(Star):
             return
         if not any(isinstance(component, Comp.Plain) for component in result.chain):
             return
-        lock = self._session_lock(event.unified_msg_origin)
-        async with lock:
-            try:
-                prepared = await self._prepare(list(result.chain))
-                groups = self._delivery_groups(prepared)
-                for index, components in enumerate(groups):
-                    if index and self.settings.send_interval:
-                        await asyncio.sleep(self.settings.send_interval)
-                    # Separate adjacent Plain components with a newline when the
-                    # message cap coalesces excess segments into the last message.
-                    chain: list = []
-                    for component in components:
-                        if chain and isinstance(chain[-1], Comp.Plain) and isinstance(component, Comp.Plain):
-                            chain.append(Comp.Plain(text="\n"))
-                        chain.append(component)
-                    try:
-                        await event.send(MessageChain(chain=chain))
-                    except Exception as error:
-                        # Don't automatically resend: OneBot may have accepted an
-                        # upload even if its acknowledgement was lost.
-                        logger.error(
-                            f"[reply_filter] 第 {index + 1}/{len(groups)} 条发送失败："
-                            f"{type(error).__name__}；未自动重试以避免重复消息",
-                        )
-            except Exception as error:
-                logger.error(f"[reply_filter] 处理失败：{type(error).__name__}；已阻止未过滤的原文发送")
-            finally:
-                # The result has been taken over even when cleaning removes all
-                # content. Never leak the unfiltered original on an exception.
-                # Don't erase a new result installed by an independent callback.
-                if event.get_result() is result:
-                    event.clear_result()
+        source_chain = result.chain
+        snapshot = list(source_chain)
+        text_snapshot = [
+            component.text if isinstance(component, Comp.Plain) else None
+            for component in snapshot
+        ]
+        try:
+            prepared = self._cap_text_segments(await self._prepare(snapshot))
+        except Exception as error:
+            # This is a display formatter, not a security boundary. On failure,
+            # keep the original result so attachments and later hooks still work.
+            logger.warning(
+                f"[reply_filter] 处理失败：{type(error).__name__}；保留原结果交由框架发送",
+            )
+            return
+        if event.get_result() is not result:
+            return
+        if result.chain is not source_chain or len(source_chain) < len(snapshot):
+            return
+        if any(
+            source_chain[index] is not component
+            or (isinstance(component, Comp.Plain) and component.text != text_snapshot[index])
+            for index, component in enumerate(snapshot)
+        ):
+            # A concurrent callback changed the source during browser rendering.
+            # Do not overwrite its edits; append-only attachments are kept below.
+            return
+        prepared.extend(source_chain[len(snapshot):])
+        # Preserve result identity, LLM metadata and the list itself. Never send,
+        # clear_result or stop here: core RespondStage must run normally so that
+        # later image decorators and after_message_sent meme senders can execute.
+        # Run before the known meme-manager decorator (99999), including when
+        # filtering removes all text and it needs to switch to an image-only reply.
+        source_chain[:] = prepared

@@ -53,8 +53,8 @@ class Settings:
     remove_think: bool = True
     blocked_words: tuple[str, ...] = ()
     max_segment_length: int = 150
-    max_messages: int = 10
-    send_interval: float = 0.6
+    max_messages: int = 10  # Soft Plain-segment cap; never discard attachments.
+    send_interval: float = 0.6  # Deprecated: core segmented_reply controls sending.
     render_timeout: float = 30.0
     image_width: int = 960
     font_size: int = 22

@@ -1,13 +1,11 @@
-"""Symbol-mode regressions for pure policy and stubbed AstrBot delivery.
+"""Symbol-mode regressions for pure policy and stubbed hook formatting.
 
-These tests deliberately use the existing plugin stubs without inheriting its
-TestCase, so discovery does not repeat the legacy hook regression suite. No
-browser, real AstrBot instance, network connection, or cache writes are needed.
+These tests deliberately use the existing plugin fixtures without inheriting a
+TestCase, so discovery does not repeat the hook regression suite. Assertions
+inspect result.chain; no real AstrBot/OneBot delivery or browser is exercised.
 """
 
-from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock
 
 from astrbot_plugin_reply_filter import processing
 from astrbot_plugin_reply_filter.processing import Settings, split_short_text
@@ -423,31 +421,12 @@ class MarkdownProbeTests(unittest.TestCase):
         self.assertFalse(MarkdownDocument().contains_markdown(processing.markdown_probe(">_<", settings)))
 
 
-class SymbolModePluginTests(unittest.IsolatedAsyncioTestCase):
-    """Own TestCase: importing helpers must not collect legacy tests twice."""
+class SymbolModePluginTests(plugin_stubs.PluginFixtures, unittest.IsolatedAsyncioTestCase):
+    """Nine formatting integration cases, not simulated or real core sending."""
 
     def make_plugin(self, **config):
-        config.setdefault("send_interval", 0)
         config.setdefault("symbol_filter_mode", "natural")
-        context = SimpleNamespace(get_registered_star=Mock(return_value=None))
-        plugin = plugin_stubs.PLUGIN.ReplyFilterPlugin(context, config)
-        plugin.renderer = SimpleNamespace(
-            document=MarkdownDocument(), render=AsyncMock(return_value=plugin_stubs.PNG),
-        )
-        return plugin
-
-    @staticmethod
-    def event(text):
-        return plugin_stubs.FakeEvent(plugin_stubs.FakeResult([plugin_stubs.Plain(text)]))
-
-    @staticmethod
-    def sent_chains(event):
-        return [awaited.args[0].chain for awaited in event.send.await_args_list]
-
-    @classmethod
-    def sent_text(cls, event):
-        return "".join(component.text for chain in cls.sent_chains(event)
-                       for component in chain if isinstance(component, plugin_stubs.Plain))
+        return super().make_plugin(**config)
 
     async def test_short_emoticons_stay_plain_in_natural_and_custom(self):
         for mode in ("natural", "custom"):
@@ -455,27 +434,31 @@ class SymbolModePluginTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(mode=mode, face=face):
                     plugin = self.make_plugin(symbol_filter_mode=mode)
                     event = self.event(face)
+                    original, chain = event.result, event.result.chain
                     await plugin.filter_reply(event)
                     plugin.renderer.render.assert_not_awaited()
-                    self.assertEqual(self.sent_chains(event), [[plugin_stubs.Plain(face)]])
-                    self.assertIsNone(event.result)
-                    self.assertEqual(event.clear_count, 1)
+                    self.assertEqual(chain, [plugin_stubs.Plain(face)])
+                    self.assert_in_place(event, original, chain)
 
-    async def test_natural_chat_symbols_survive_actual_delivery(self):
+    async def test_natural_chat_symbols_survive_hook_formatting(self):
         plugin = self.make_plugin()
         source = "好呀~🙂稍等…马上来！"
         event = self.event(source)
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_not_awaited()
-        self.assertEqual(self.sent_chains(event), [[plugin_stubs.Plain("好呀~🙂稍等…马上来")]])
+        self.assertEqual(chain, [plugin_stubs.Plain("好呀~🙂稍等…马上来")])
+        self.assert_in_place(event, original, chain)
 
-    async def test_custom_keep_and_remove_are_used_by_delivery(self):
+    async def test_custom_keep_and_remove_are_used_by_hook_formatting(self):
         plugin = self.make_plugin(symbol_filter_mode="custom", custom_keep_symbols="，",
                                   custom_remove_symbols="🙂")
         event = self.event("甲，🙂乙！")
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_not_awaited()
-        self.assertEqual(self.sent_chains(event), [[plugin_stubs.Plain("甲，乙")]])
+        self.assertEqual(chain, [plugin_stubs.Plain("甲，乙")])
+        self.assert_in_place(event, original, chain)
 
     async def test_real_markdown_renders_original_despite_custom_deletion(self):
         for source in ("**粗体** >_<", "```python\nprint('(^_^)')\n```",
@@ -483,45 +466,53 @@ class SymbolModePluginTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(source=source):
                 plugin = self.make_plugin(symbol_filter_mode="custom", custom_remove_symbols="*_>")
                 event = self.event(source)
+                original, chain = event.result, event.result.chain
                 await plugin.filter_reply(event)
                 plugin.renderer.render.assert_awaited_once_with(source, "image")
-                self.assertIsInstance(self.sent_chains(event)[0][0], plugin_stubs.Image)
-                self.assertEqual(self.sent_chains(event)[0][0].data, plugin_stubs.PNG)
+                self.assertIsInstance(chain[0], plugin_stubs.Image)
+                self.assertEqual(chain[0].data, plugin_stubs.PNG)
+                self.assert_in_place(event, original, chain)
 
     async def test_long_plain_reply_renders_original_not_filtered_or_probe_text(self):
         source = "长文本(^_^)🙂，保留全部原文！"
         plugin = self.make_plugin(symbol_filter_mode="custom", long_text_threshold=5,
                                   custom_remove_symbols="_🙂，！")
         event = self.event(source)
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_awaited_once_with(source, "image")
-        self.assertIsInstance(self.sent_chains(event)[0][0], plugin_stubs.Image)
+        self.assertIsInstance(chain[0], plugin_stubs.Image)
+        self.assert_in_place(event, original, chain)
 
     async def test_strict_keeps_existing_markdown_detection_for_blockquote_like_face(self):
         plugin = self.make_plugin(symbol_filter_mode="strict")
         event = self.event(">_<")
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_awaited_once_with(">_<", "image")
-        self.assertIsInstance(self.sent_chains(event)[0][0], plugin_stubs.Image)
+        self.assertIsInstance(chain[0], plugin_stubs.Image)
+        self.assert_in_place(event, original, chain)
 
     async def test_strip_false_disables_custom_deletion_without_false_markdown(self):
         plugin = self.make_plugin(symbol_filter_mode="custom", strip_symbols=False,
                                   custom_remove_symbols="_🙂")
         event = self.event(">_<🙂，乙！")
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_not_awaited()
-        self.assertEqual(self.sent_chains(event), [
-            [plugin_stubs.Plain(">_<🙂")], [plugin_stubs.Plain("乙")],
-        ])
+        self.assertEqual(chain, [plugin_stubs.Plain(">_<🙂\n"), plugin_stubs.Plain("乙")])
+        self.assert_in_place(event, original, chain)
 
     async def test_adjacent_plain_components_merge_before_emoticon_probe(self):
         plugin = self.make_plugin()
         event = plugin_stubs.FakeEvent(plugin_stubs.FakeResult([
             plugin_stubs.Plain(">"), plugin_stubs.Plain("_<"),
         ]))
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_not_awaited()
-        self.assertEqual(self.sent_chains(event), [[plugin_stubs.Plain(">_<")]])
+        self.assertEqual(chain, [plugin_stubs.Plain(">_<")])
+        self.assert_in_place(event, original, chain)
 
     async def test_render_failure_keeps_original_markdown_in_custom_mode(self):
         source = "**粗体** >_< 🙂！"
@@ -529,10 +520,11 @@ class SymbolModePluginTests(unittest.IsolatedAsyncioTestCase):
                                   pdf_on_image_error=False)
         plugin.renderer.render.side_effect = RuntimeError("render unavailable")
         event = self.event(source)
+        original, chain = event.result, event.result.chain
         await plugin.filter_reply(event)
         plugin.renderer.render.assert_awaited_once_with(source, "image")
-        self.assertEqual(self.sent_text(event), source)
-        self.assertIsNone(event.result)
+        self.assertEqual(chain, [plugin_stubs.Plain(source)])
+        self.assert_in_place(event, original, chain)
 
 
 if __name__ == "__main__":
