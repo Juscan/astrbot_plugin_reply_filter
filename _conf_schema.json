@@ -1,0 +1,116 @@
+{
+  "enabled": {
+    "description": "启用回复过滤插件",
+    "type": "bool",
+    "default": true
+  },
+  "force_non_streaming": {
+    "description": "对 OneBot 事件请求非流式输出",
+    "type": "bool",
+    "default": true,
+    "hint": "流式内容会绕过最终输出钩子。默认提前写入 enable_streaming=false；Live Mode、直接send和其他插件主动覆盖不在保证范围内。"
+  },
+  "long_text_threshold": {
+    "description": "长文本阈值（严格大于才渲染）",
+    "type": "int",
+    "default": 150,
+    "hint": "1～100000。清理后的整条回复，排除空白的 Unicode 字符数，标点计数；Markdown不受此阈值限制。"
+  },
+  "render_mode": {
+    "description": "渲染模式",
+    "type": "string",
+    "default": "image",
+    "options": ["image", "pdf", "auto"],
+    "hint": "image=PNG；pdf=A4 PDF；auto=超过auto_pdf_threshold使用PDF，否则PNG。"
+  },
+  "auto_pdf_threshold": {
+    "description": "auto模式改用PDF的阈值",
+    "type": "int",
+    "default": 3000,
+    "hint": "1～100000，严格大于才使用PDF。"
+  },
+  "pdf_on_image_error": {
+    "description": "PNG渲染失败后尝试PDF",
+    "type": "bool",
+    "default": true,
+    "hint": "最终渲染失败时使用保留Markdown符号的文本回退。发送失败不自动重发，避免重复消息。"
+  },
+  "split_symbols": {
+    "description": "短文本分段符号",
+    "type": "string",
+    "default": "\n。.！？!?；;，,、：:…~～|｜",
+    "hint": "逐字符匹配，不是正则表达式；默认包含换行和中英文标点。分隔符本身不发送。"
+  },
+  "strip_symbols": {
+    "description": "短文本分段后移除符号",
+    "type": "bool",
+    "default": true,
+    "hint": "移除 Unicode P/S 类字符，包括引号、括号、运算符和大部分emoji。长文本/Markdown保留符号；并非敏感内容审核器。"
+  },
+  "preserve_urls_numbers": {
+    "description": "保护URL、邮箱和结构化数字",
+    "type": "bool",
+    "default": true,
+    "hint": "保留链接、小数、版本号、日期、时间和百分比中的标点。关闭会破坏这些文本。保护原子可超过单段软长度限制。"
+  },
+  "remove_think": {
+    "description": "移除正文中的思考标签内容",
+    "type": "bool",
+    "default": true,
+    "hint": "删除 think/thinking/analysis 标签及其内容，支持嵌套；未闭合块的尾部也删除。不是所有模型思考格式的通用识别器。"
+  },
+  "blocked_words": {
+    "description": "需要删除的字面词句",
+    "type": "list",
+    "default": [],
+    "hint": "字符串列表，逐项区分大小写替换为空，不是正则表达式，也不是安全审核。默认不删除词句。"
+  },
+  "max_segment_length": {
+    "description": "短文本单段软长度上限",
+    "type": "int",
+    "default": 150,
+    "hint": "1～10000。保护的URL/邮箱/数字不会被拆坏；max_messages合并尾部时也可能超过此长度。"
+  },
+  "max_messages": {
+    "description": "单条LLM回复最多几个发送组",
+    "type": "int",
+    "default": 10,
+    "hint": "1～50。多出的片段合并到最后一组，不截断内容；平台可能进一步拆发文件/转发，超大回退消息仍可能超过OneBot端限制。"
+  },
+  "send_interval": {
+    "description": "同一回复的发送间隔（秒）",
+    "type": "float",
+    "default": 0.6,
+    "hint": "0～10。相同会话在本插件内顺序发送；不能保证平台不触发风控。"
+  },
+  "render_timeout": {
+    "description": "每次渲染总超时（秒）",
+    "type": "float",
+    "default": 30.0,
+    "hint": "0.1～300，包含共享浏览器队列等待；PNG和PDF各自计算。"
+  },
+  "image_width": {
+    "description": "渲染视口宽度",
+    "type": "int",
+    "default": 960,
+    "hint": "320～1920像素。"
+  },
+  "font_size": {
+    "description": "图片正文字号",
+    "type": "int",
+    "default": 22,
+    "hint": "12～48像素；PDF使用打印样式的12pt字号。"
+  },
+  "max_render_chars": {
+    "description": "浏览器最大输入字符数",
+    "type": "int",
+    "default": 100000,
+    "hint": "1000～500000，含空白。超过后直接完整文本回退，不截断；不代表OneBot能接受任意大的消息。"
+  },
+  "cache_retention_hours": {
+    "description": "PDF缓存保留时间（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "1～168。每次生成新PDF时清理本插件的过期PDF；总上限256MiB，单文件32MiB。缓存含回复内容，注意本机权限。"
+  }
+}
