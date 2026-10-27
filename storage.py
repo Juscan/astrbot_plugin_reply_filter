@@ -21,9 +21,9 @@ def save_pdf(data: bytes, directory: Path, retention_hours: int) -> Path:
     cutoff = time.time() - retention_hours * 3600
     files: list[tuple[float, int, Path]] = []
     for path in directory.glob("reply-*.pdf"):
-        if path.is_symlink() or path.resolve().parent != directory:
-            continue
         try:
+            if path.is_symlink() or path.resolve().parent != directory:
+                continue
             stat = path.stat()
             if stat.st_mtime < cutoff:
                 path.unlink()

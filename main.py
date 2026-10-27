@@ -16,6 +16,7 @@ from .processing import (
     cap_messages,
     clean_text,
     fallback_chunks,
+    markdown_probe,
     render_kind,
     split_short_text,
 )
@@ -24,8 +25,8 @@ from .storage import save_pdf
 
 
 @register(
-    "astrbot_plugin_reply_filter", "AstrBot community",
-    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.0.0",
+    "astrbot_plugin_reply_filter", "Jusc",
+    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.0",
 )
 class ReplyFilterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -101,7 +102,7 @@ class ReplyFilterPlugin(Star):
         combined = "\n".join(texts)
         kind = render_kind(
             combined,
-            any(self.renderer.document.contains_markdown(text) for text in texts),
+            any(self.renderer.document.contains_markdown(markdown_probe(text, self.settings)) for text in texts),
             self.settings,
         )
         prepared: list = []

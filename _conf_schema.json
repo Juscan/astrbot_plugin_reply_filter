@@ -45,7 +45,26 @@
     "description": "短文本分段后移除符号",
     "type": "bool",
     "default": true,
-    "hint": "移除 Unicode P/S 类字符，包括引号、括号、运算符和大部分emoji。长文本/Markdown保留符号；并非敏感内容审核器。"
+    "hint": "短文本去符号总开关，具体规则由symbol_filter_mode选择。关闭后自定义删除也不生效，但仍分段；长文本/Markdown不执行去符号。"
+  },
+  "symbol_filter_mode": {
+    "description": "符号过滤模式（自然聊天选natural）",
+    "type": "string",
+    "default": "strict",
+    "options": ["strict", "natural", "custom"],
+    "hint": "strict=旧版严格去符号；natural=去普通标点，保留emoji、常见颜文字、货币/单位/运算符和语气波浪线；custom=自然聊天加自定义保留/删除。默认strict兼容旧配置，日常聊天推荐手动选natural。"
+  },
+  "custom_keep_symbols": {
+    "description": "自定义保留字符（仅custom模式）",
+    "type": "string",
+    "default": "",
+    "hint": "如：，。！？。逐字符匹配，非正则，最多256字符且不能含控制字符。保留项不分段；与自定义删除冲突时删除优先。"
+  },
+  "custom_remove_symbols": {
+    "description": "自定义删除字符（仅custom模式）",
+    "type": "string",
+    "default": "",
+    "hint": "如：★☆。逐字符匹配，非正则，最多256字符且不能含控制字符。命中emoji/颜文字内任一字符会删除整个原子；URL和数字保护优先，strip_symbols关闭后不删除。"
   },
   "preserve_urls_numbers": {
     "description": "保护URL、邮箱和结构化数字",
@@ -69,7 +88,7 @@
     "description": "短文本单段软长度上限",
     "type": "int",
     "default": 150,
-    "hint": "1～10000。保护的URL/邮箱/数字不会被拆坏；max_messages合并尾部时也可能超过此长度。"
+    "hint": "1～10000。保护的URL/邮箱/数字不会被拆坏；natural/custom还保护完整字素和常见颜文字。原子或max_messages合并尾部时可超过此软长度。"
   },
   "max_messages": {
     "description": "单条LLM回复最多几个发送组",

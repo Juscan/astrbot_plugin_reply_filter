@@ -1,12 +1,56 @@
-# 插件由ai辅助生成
-
 # 回复过滤与分段渲染
 
-AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文本按标点分段并去符号；**超过 150 字或包含 Markdown** 时，调用 [astrbot_plugin_browser](https://github.com/rytte/astrbot_plugin_browser/) 的共享 Chromium 渲染为 PNG 或 PDF。
+AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文本按标点分段并按所选模式过滤符号；**超过 150 字或包含 Markdown** 时，调用 [astrbot_plugin_browser](https://github.com/rytte/astrbot_plugin_browser/) 的共享 Chromium 渲染为 PNG 或 PDF。
 
 不需要再启动第二套浏览器，不调用外部截图网站。
 
-## 处理效果
+- 仓库：[Juscan/astrbot_plugin_reply_filter](https://github.com/Juscan/astrbot_plugin_reply_filter)
+- 作者：**Jusc**
+- 即将升级版本：**1.1.0**；变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 1.1.0：精细过滤，尤其适合自然聊天
+
+新增 `symbol_filter_mode`，提供 `strict`、`natural`、`custom` 三种短文本符号过滤模式。**默认仍为 `strict`，兼容旧版行为；升级后不会自动变成自然模式。** 日常聊天请在 AstrBot 插件配置页**手动选择 `natural`**，不需要修改大模型提示词。
+
+| 模式 | 短文本行为（`strip_symbols=true` 时） |
+| --- | --- |
+| `strict` | 兼容旧版：移除 Unicode P（标点）/ S（符号）类字符，包括大部分 emoji；URL、邮箱、结构化数字仍按保护开关处理 |
+| `natural` | 去掉普通标点，保留 Unicode S 类符号、下列聊天符号、完整 emoji 组合和已识别的常见颜文字 |
+| `custom` | 以 `natural` 为基础，再应用 `custom_keep_symbols` / `custom_remove_symbols`；删除优先于保留 |
+
+自然模式额外保留的聊天符号是 `~～…%％‰‱@#&/\_*-`。emoji 组合按整体保护，例如家庭 ZWJ `👨‍👩‍👧‍👦`、肤色 `👍🏽`、旗帜 `🇨🇳`、键帽 `1️⃣`，不会拆成零散字符。
+
+常见颜文字示例：`(^_^)`、`(｡･ω･｡)ﾉ`、`(๑•̀ㅂ•́)و`、`T_T`、`>_<`、`:-)`、`¯\_(ツ)_/¯`。识别采用**有限启发式**，不承诺识别所有颜文字；**普通括号内容不受保护**，不会因为文字放在括号里就完整保留括号。已识别颜文字不会仅因其中的 `>_<` 被误判为 Markdown；真正的 Markdown 仍按原规则渲染。
+
+### 自然聊天示例
+
+选择 `natural`，保持默认分段符号和其他默认设置：
+
+```text
+输入：你好呀～😊，今天也要开心(^_^)！
+输出：你好呀～😊
+      今天也要开心(^_^)
+```
+
+```text
+输入：预算 ¥100，温度 26℃，加油 👍🏽！
+输出：预算 ¥100
+      温度 26℃
+      加油 👍🏽
+```
+
+这些是配置行为示例，不是本次新增模式已经完成本地或真实 QQ 验证的声明。
+
+### 自定义与优先级
+
+- `custom_keep_symbols`、`custom_remove_symbols` 默认都是空字符串，**只在 `custom` 模式生效**；各自长度不超过 **256 个字符**。按字符串中的每个字符匹配，**不是正则表达式**，也不是逗号分隔的规则列表。
+- `custom` 以 `natural` 为基础。一个字符同时出现在保留和删除列表时，**删除优先**。删除列表命中已识别 emoji 或颜文字内部的任一字符时，**删除整个原子**，不会残留半个表情。例如删除 `🏽` 会移除整个 `👍🏽`。
+- `preserve_urls_numbers=true` 时，HTTP(S) URL、邮箱和结构化数字的保护**优先级最高**，自定义删除也不能修改它们。确实要过滤其中的符号，必须先关闭 `preserve_urls_numbers`；这可能破坏链接、邮箱或数字格式。
+- **保留字符优先于 `split_symbols`**：自然模式保留的波浪线即使出现在分段列表中也不拆；自定义保留 `,，` 后，这两个逗号不删除、也不分段。完整的受保护 emoji、颜文字和 URL/数字原子同样不从内部拆开。
+- `strip_symbols=false` 会关闭符号移除，**包括 `custom_remove_symbols` 的删除**，但 `split_symbols` 分段仍执行，分隔符仍不发送；保护/保留项不参与分段。
+- 以上模式只作用于**短文本**。大于阈值或真正 Markdown 的渲染输入仍是经过思考块、控制字符、字面词句清理后的原文，**不应用短文本去符号或自定义删除规则**。
+
+## 处理效果与运行管线
 
 | 清理后的回复 | 默认行为 |
 | --- | --- |
@@ -22,8 +66,8 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 
 1. 只接管 OneBot 的非流式 `LLM_RESULT`，不拦截普通命令回复。
 2. 合并相邻文本组件，移除 `think` / `thinking` / `analysis` 标签及内容、异常控制字符、配置的字面词句。
-3. 按清理后的**整条回复**决定路由：非空白 Unicode 字符数严格大于阈值，或 Markdown 语法树存在格式节点，即进入渲染。标点也计入字数；不是分词后的“词数”。
-4. 只有短文本才分段、去符号。**不能先破坏 Markdown 再渲染。**
+3. 按清理后的**整条回复**决定路由：非空白 Unicode 字符数严格大于阈值，或 Markdown 语法树存在格式节点，即进入渲染。标点也计入字数；不是分词后的“词数”。识别出的颜文字不单独触发 Markdown 误判，不影响真实 Markdown 的识别。
+4. 只有短文本才分段、按所选模式去符号。**不能先破坏 Markdown 再渲染。**
 5. 保留原回复中的图片、文件等非文本组件及其顺序。混合消息会按各连续文本区分别渲染，不会把附件吞掉；因此一条混合回复可能生成多张图。
 
 过滤只影响本插件发送给用户的显示内容，不重写模型上下文、数据库历史或其他插件直接发送的消息。
@@ -35,24 +79,37 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 - 安装并启用 **astrbot_plugin_browser >= 0.4.0**，确保它自己的 Chromium 服务可以正常使用。
 - Python >= 3.10；实际版本还须满足 AstrBot 和 browser 插件各自要求。
 - 渲染机器需要可用的中文字体，例如 Noto Sans CJK SC / 微软雅黑。字体缺失请按 browser 插件文档配置。
+- 1.1.0 新增 Python 依赖 **`regex`**，用于完整 emoji 组合等处理；更新后请确认 [requirements.txt](requirements.txt) 中的依赖安装成功，再重载插件。
 
 外部 browser 插件不是 pip 依赖，**不会由本插件静默安装**。
 
-## 安装
+## 安装与更新
 
 1. 在 AstrBot 插件管理中，先通过 `https://github.com/rytte/astrbot_plugin_browser` 安装并启用浏览器插件，按其文档完成浏览器环境安装。
-2. 安装本仓库：发布后可在插件管理页填你的仓库地址；或将本目录放到 AstrBot 的 `data/plugins/astrbot_plugin_reply_filter/`。
-3. 如依赖未自动安装，在 **AstrBot 使用的 Python 环境**安装 [requirements.txt](requirements.txt)：
+2. 安装本插件时，在插件管理页填入 `https://github.com/Juscan/astrbot_plugin_reply_filter`；已有安装则使用插件管理页的更新操作。也可将本目录放到 AstrBot 的 `data/plugins/astrbot_plugin_reply_filter/`。
+3. **升级 1.1.0 后确认依赖安装成功，尤其是新增的 `regex`。** 如依赖未自动安装，在 **AstrBot 使用的 Python 环境**安装 [requirements.txt](requirements.txt)：
 
    ```bash
    python -m pip install -r data/plugins/astrbot_plugin_reply_filter/requirements.txt
    ```
 
-4. 重启或重载本插件，在配置页选择 `image`、`pdf` 或 `auto`。
-5. 默认 `force_non_streaming=true` 会对 OneBot 事件提前请求非流式。若仍出现逐字/逐段抢先发送，请关闭 AstrBot 当前会话/配置的流式输出，并排查其他插件。
-6. 关闭 AstrBot 内置文本转图、分段、TTS以及其他同类“最终回复处理”插件，避免冲突。它们不是本插件的渲染依赖。
+4. 重启或重载本插件。依赖安装或加载报错时，先查看 AstrBot 日志并解决问题，不要只保存配置后继续使用未重载的旧版本。
+5. 按下面的配置页教程选择模式。默认 `force_non_streaming=true` 会对 OneBot 事件提前请求非流式；若仍出现逐字/逐段抢先发送，请关闭 AstrBot 当前会话/配置的流式输出，并排查其他插件。
+6. 关闭 AstrBot 内置文本转图、分段、TTS 以及其他同类“最终回复处理”插件，避免冲突。它们不是本插件的渲染依赖。
 
-ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目录，下一层即可看到 [main.py](main.py) 和 [metadata.yaml](metadata.yaml)。
+ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目录，下一层即可看到 [main.py](main.py) 和 [metadata.yaml](metadata.yaml)。1.1.0 的插件包名为 `astrbot_plugin_reply_filter-1.1.0.zip`。
+
+### 在 AstrBot 配置页启用自然聊天
+
+不同 AstrBot 版本的按钮名称可能略有差异，按以下字段名寻找即可：
+
+1. 打开 AstrBot WebUI → **插件管理**，找到“回复过滤与分段渲染”或 `astrbot_plugin_reply_filter`，打开该插件的**配置**。
+2. 确认总开关 `enabled` 为开启。
+3. 找到 `symbol_filter_mode` 的下拉选项，**从默认 `strict` 手动改选 `natural`**。仅升级版本、保持 `strict` 不变，仍是旧版严格过滤。
+4. 保持 `strip_symbols=true`（去掉普通标点）和 `preserve_urls_numbers=true`（保护链接、邮箱、数字）；先保留默认 `split_symbols`。不必修改大模型提示词。
+5. 按需设置 `render_mode`：`image` 为 PNG，`pdf` 为 PDF，`auto` 根据长度选择；不确定时保持 `image`。
+6. 点击**保存**。安装/更新完成、依赖确认成功后重载插件；如当前界面提示配置需重载，也按提示执行。使用上面的自然聊天示例进行实际检查。
+7. 需要额外规则时，将 `symbol_filter_mode` 改为 `custom`，再填 `custom_keep_symbols` / `custom_remove_symbols` 并保存。例如保留字段填 `,，`，可让中英文逗号留在短文本中且不按逗号分段。两个字段在 `strict` / `natural` 下不起作用。
 
 ### PDF 与分容器部署
 
@@ -67,7 +124,7 @@ PDF 使用 AstrBot `File` 组件：
 
 **发送失败不自动重发。** OneBot 可能已经接受消息，只是确认超时；自动重试会导致重复消息。日志中会注明第几个发送组失败。文本回退针对的是**发送之前的渲染失败**，不是对文件上传失败的盲目重试。
 
-## 配置
+## 配置参考
 
 完整配置定义见 [_conf_schema.json](_conf_schema.json)。保存错误类型、越界或非有限数值会明确报错，不静默更改。
 
@@ -79,9 +136,12 @@ PDF 使用 AstrBot `File` 组件：
 | `render_mode` | `image` | `image` / `pdf` / `auto` |
 | `auto_pdf_threshold` | `3000` | auto 模式严格大于此值改用 PDF |
 | `pdf_on_image_error` | `true` | PNG 渲染失败后再试 PDF |
-| `split_symbols` | 换行及中英文常用标点 | 逐字符分隔，不是正则；分隔符不发送 |
-| `strip_symbols` | `true` | 短文本移除 Unicode P/S 类字符，包括大部分 emoji |
-| `preserve_urls_numbers` | `true` | 保护 HTTP(S) URL、邮箱、小数、版本、日期、时间、百分比和带符号数字 |
+| `split_symbols` | 换行及中英文常用标点 | 逐字符分隔，不是正则；分隔符不发送，保护/保留项优先且不分段 |
+| `strip_symbols` | `true` | 启用所选模式的短文本符号移除；关闭时也不执行自定义删除，但仍分段 |
+| `symbol_filter_mode` | `strict` | `strict` 兼容旧版；`natural` 自然聊天；`custom` 在自然模式上自定义 |
+| `custom_keep_symbols` | `""` | 仅 custom 生效；逐字符保留，优先于分段；长度 ≤ 256，不是正则 |
+| `custom_remove_symbols` | `""` | 仅 custom 生效；逐字符删除，优先于保留；命中表情内任一字符则整原子删除；长度 ≤ 256 |
+| `preserve_urls_numbers` | `true` | 最高优先级保护 HTTP(S) URL、邮箱、小数、版本、日期、时间、百分比和带符号数字 |
 | `remove_think` | `true` | 移除指定思考标签块，未闭合尾部也移除 |
 | `blocked_words` | `[]` | 字符串列表，按列表顺序、区分大小写、字面替换为空 |
 | `max_segment_length` | `150` | 短文本单段软上限；不拆坏保护的原子 |
@@ -91,16 +151,17 @@ PDF 使用 AstrBot `File` 组件：
 | `image_width` | `960` | 视口宽度，320～1920px |
 | `font_size` | `22` | 图片字号，12～48px；PDF 使用打印字号 12pt |
 | `max_render_chars` | `100000` | 单个文本区含空白的最大渲染字符数，超出则完整文本回退 |
-| `cache_retention_hours` | `24` | 下次生成 PDF 时清理超时缓存，1～168小时 |
+| `cache_retention_hours` | `24` | 下次生成 PDF 时清理超时缓存，1～168 小时 |
 
 推荐：
 
-- 日常聊天：保持默认设置。
-- 不想删除 emoji/运算符：关闭 `strip_symbols`，分段仍有效。
-- 所有符号都想删除，包括 URL/小数里的标点：关闭 `preserve_urls_numbers`，但这会损坏链接、邮箱和数字，请谨慎。
+- 日常聊天：**手动选择 `symbol_filter_mode=natural`**；默认 `strict` 是为兼容旧版保留的。
+- 有针对性的保留/删除需求：选择 `custom`，再填写两个自定义字段。
+- 不想进行符号移除：关闭 `strip_symbols`；分段仍有效，保护/保留项仍不拆分。
+- 希望过滤 URL/小数里的符号：必须关闭 `preserve_urls_numbers` 后再按模式配置，但这会损坏链接、邮箱和数字，请谨慎。
 - 文档为主：`render_mode=auto`，PDF 在手机端可放大、搜索和复制。
 
-默认短文本示例：
+默认严格模式短文本示例：
 
 ```text
 输入：价格 -3.14，版本 v1.2.3，访问 https://example.com/a?x=1。
@@ -109,7 +170,7 @@ PDF 使用 AstrBot `File` 组件：
       访问 https://example.com/a?x=1
 ```
 
-分隔符以外的标点/符号在去符号阶段直接删除，不额外创建段落；可以自行把需要分段的字符加入 `split_symbols`。URL 应与后文用空白或中文句末标点分开，插件不能可靠推断网址后紧贴的普通文字是否属于 URL。
+分隔符以外的标点/符号按所选模式处理；去符号阶段的删除不额外创建段落。可自行把需要分段的字符加入 `split_symbols`，但保护/保留项始终优先。URL 应与后文用空白或中文句末标点分开，插件不能可靠推断网址后紧贴的普通文字是否属于 URL。
 
 ## 限制与安全说明
 
@@ -129,7 +190,7 @@ PDF 使用 AstrBot `File` 组件：
 
 Markdown 转 HTML 时禁用原始 HTML，浏览器 JavaScript 关闭，并使用 CSP 禁止远程资源。Markdown 图片变成替代文字占位，不下载模型提供的图片地址、内网地址或本地文件。链接保留为可读/可点击文本，但渲染不打开目标。
 
-过滤思考块是显示清理，不是通用防泄漏机制；`blocked_words` 也**不是敏感内容审核器**。默认去符号会改变运算式或表情语义；需要精确保留时请关闭该项。
+过滤思考块是显示清理，不是通用防泄漏机制；`blocked_words` 也**不是敏感内容审核器**。严格模式去符号会改变运算式或表情语义；自然模式和有限颜文字启发式也不是所有文本的无损转换。需要精确保留时请关闭 `strip_symbols`，并检查分段和保护配置。
 
 ### 缓存与限额
 

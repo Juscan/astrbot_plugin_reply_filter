@@ -8,6 +8,8 @@ import unicodedata
 from dataclasses import dataclass, fields
 from typing import Any, Mapping
 
+from .symbols import chat_units, keep_naturally, mask_emoticons
+
 DEFAULT_SPLIT_SYMBOLS = "\n。.！？!?；;，,、：:…~～|｜"
 _THINK_TAG = re.compile(r"<\s*(/?)\s*(think|thinking|analysis)\s*>", re.I)
 _PROTECTED = re.compile(
@@ -44,6 +46,9 @@ class Settings:
     pdf_on_image_error: bool = True
     split_symbols: str = DEFAULT_SPLIT_SYMBOLS
     strip_symbols: bool = True
+    symbol_filter_mode: str = "strict"
+    custom_keep_symbols: str = ""
+    custom_remove_symbols: str = ""
     preserve_urls_numbers: bool = True
     remove_think: bool = True
     blocked_words: tuple[str, ...] = ()
@@ -94,6 +99,16 @@ class Settings:
             raise ValueError("render_mode 必须为 image、pdf 或 auto")
         if "split_symbols" in values and not isinstance(values["split_symbols"], str):
             raise ValueError("split_symbols 必须是字符串，不是正则表达式")
+        if values.get("symbol_filter_mode", "strict") not in ("strict", "natural", "custom"):
+            raise ValueError("symbol_filter_mode 必须为 strict、natural 或 custom")
+        for name in ("custom_keep_symbols", "custom_remove_symbols"):
+            if name in values:
+                value = values[name]
+                if (
+                    not isinstance(value, str) or len(value) > 256
+                    or any(unicodedata.category(char) == "Cc" for char in value)
+                ):
+                    raise ValueError(f"{name} 必须是不含控制字符、至多256字符的字符串")
         words = values.get("blocked_words", ())
         if not isinstance(words, (list, tuple)) or any(
             not isinstance(word, str) or not word.strip() for word in words
@@ -156,30 +171,55 @@ def render_kind(text: str, has_markdown: bool, settings: Settings) -> str | None
     return "image"
 
 
-def _units(text: str, protect: bool):
-    """Yield (text, protected) units without encoding sentinel characters."""
+def markdown_probe(text: str, settings: Settings) -> str:
+    """Prevent chat faces such as >_< from looking like Markdown blockquotes."""
+    if settings.symbol_filter_mode == "strict":
+        return text
+    return mask_emoticons(text)
+
+
+def _units(text: str, protect: bool, chat: bool = False):
+    """Yield (text, origin) units: plain, chat atom, or protected URL/number."""
+    def plain(value: str):
+        if chat:
+            yield from ((unit, "chat" if atom else "plain") for unit, atom in chat_units(value))
+        else:
+            yield from ((char, "plain") for char in value)
+
     if not protect:
-        yield from ((char, False) for char in text)
+        yield from plain(text)
         return
     cursor = 0
     for match in _PROTECTED.finditer(text):
-        yield from ((char, False) for char in text[cursor:match.start()])
+        # A numeric prefix such as +1 in +1️⃣ must not detach a following
+        # variation selector/keycap/combining mark from its grapheme.
+        if chat and match.end() < len(text) and (
+            unicodedata.category(text[match.end()]).startswith("M")
+            or text[match.end()] == "\u200d"
+        ):
+            continue
+        yield from plain(text[cursor:match.start()])
         value = match.group()
         protected = _trim_url(value) if value.lower().startswith("http") else value
         if protected:
-            yield protected, True
-        yield from ((char, False) for char in value[len(protected):])
+            yield protected, "url_number"
+        yield from plain(value[len(protected):])
         cursor = match.end()
-    yield from ((char, False) for char in text[cursor:])
+    yield from plain(text[cursor:])
 
 
 def split_short_text(text: str, settings: Settings) -> list[str]:
-    """Split first, then strip Unicode punctuation/symbols from short replies.
+    """Split short replies using a backwards-compatible or chat-safe policy.
 
-    URLs, emails and structured numbers are atomic by default. The length cap is
-    soft for those atoms so URLs and decimals are never silently corrupted.
+    URLs/numbers have highest priority. Chat mode also protects graphemes and
+    known faces; retained symbols override delimiters. Custom removal overrides
+    retention, but a removed ordinary delimiter still creates a boundary.
     """
     delimiters = set(settings.split_symbols)
+    chat = settings.symbol_filter_mode != "strict"
+    custom = settings.symbol_filter_mode == "custom"
+    keep = set(settings.custom_keep_symbols) if custom else set()
+    remove = set(settings.custom_remove_symbols) if custom and settings.strip_symbols else set()
     segments: list[str] = []
     current: list[str] = []
     length = 0
@@ -192,15 +232,20 @@ def split_short_text(text: str, settings: Settings) -> list[str]:
         current.clear()
         length = 0
 
-    for unit, protected in _units(text, settings.preserve_urls_numbers):
-        if not protected and unit in delimiters:
-            flush()
-            continue
-        if (
-            not protected and settings.strip_symbols
-            and unicodedata.category(unit)[0] in "PS"
-        ):
-            continue
+    for unit, origin in _units(text, settings.preserve_urls_numbers, chat):
+        if origin != "url_number":
+            removed = bool(remove.intersection(unit))
+            retained = chat and (
+                origin == "chat" or keep_naturally(unit) or bool(keep.intersection(unit))
+            ) and not removed
+            if not retained and origin != "chat" and unit[0] in delimiters:
+                flush()
+                continue
+            if removed or (
+                not retained and settings.strip_symbols
+                and unicodedata.category(unit[0])[0] in "PS"
+            ):
+                continue
         if length and length + len(unit) > settings.max_segment_length:
             flush()
         current.append(unit)
