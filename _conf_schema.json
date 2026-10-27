@@ -94,13 +94,20 @@
     "description": "文本段数量软上限（保留所有附件）",
     "type": "int",
     "default": 10,
-    "hint": "1～50。达到上限后仅合并相邻文本段，不跨图片/表情/文件等组件合并或删附件；因此可超过上限。实际气泡数由AstrBot核心分段和协议端决定。"
+    "hint": "1～50。达到上限后仅合并相邻文本段，不跨图片/表情/文件等组件合并或删附件；因此可超过上限，不是最终QQ气泡数保证。"
+  },
+  "send_mode": {
+    "description": "短文本发送方式（默认独立气泡）",
+    "type": "string",
+    "default": "segments",
+    "options": ["segments", "core"],
+    "hint": "segments=恢复第一版一段一气泡，无需开启核心分段；前段由插件发送，末段和全部附件交核心及表情插件。core=仅装饰，同条换行或按核心设置分段。前置/交错附件会保守留核心，不跨附件抢发文本。"
   },
   "send_interval": {
-    "description": "旧版发送间隔（已弃用，仅兼容保存）",
+    "description": "独立气泡发送间隔（秒）",
     "type": "float",
     "default": 0.6,
-    "hint": "0～10，1.1.1起不再控制发送。为保留表情插件的发送后钩子，交由AstrBot正常发送；请在核心segmented_reply中设置interval_method=random、interval=0.6,0.6。"
+    "hint": "0～10。segments模式每个预发段后等待（包括到末段之前），首段不等待；core模式忽略此值。后续插件或核心处理可能增加延迟，不保证平台风控或跨会话顺序。"
   },
   "render_timeout": {
     "description": "每次渲染总超时（秒）",

@@ -1,8 +1,10 @@
 """Hook regressions and explicitly simulated core delivery using public API stubs.
 
 No real AstrBot installation, OneBot connection, browser, or cache writes are used.
-``simulated_respond`` models only decorator ordering, one normal send and after
-callbacks; it is not AstrBot's real pipeline or a OneBot integration test.
+``simulated_respond`` models decorator ordering, one normal send (ordinary
+failures are caught before after callbacks), and optional Plain-only prefix
+sends. It is not AstrBot's real pipeline or a OneBot integration test and does
+not model the core decorator's BaseException/cancellation handling.
 The import patch restores sys.modules; only the loaded main module is retained.
 """
 
@@ -183,13 +185,15 @@ def assert_no_hook_delivery(event):
     event.stop_event.assert_not_called()
 
 
-async def simulated_respond(event, *, decorating_hooks=(), after_hooks=()):
-    """Minimal, explicit simulation, not a real AstrBot or segmented-send API.
+async def simulated_respond(event, *, decorating_hooks=(), after_hooks=(), allow_prefix=False):
+    """Explicit core-segmentation-OFF model, not a real AstrBot/OneBot pipeline.
 
-    Descending decorator priority is modeled here. Only this helper performs the
-    normal send and invokes the supplied after hooks. The result has no split API.
-    Each decorator must leave delivery to the core: no sends, clears or stops are
-    accepted before the single normal send, even if a decorator empties the body.
+    Descending priority and one normal send are modeled. The normal send's
+    ordinary exception is recorded and after callbacks still run, matching the
+    observed core path; this does NOT prove delivery success or exactly-once.
+    Core-only tests reject any decorator send. Segment tests opt into Plain-only
+    prefix sends. This helper deliberately does not claim to model cancellation:
+    the real decoration stage catches BaseException, unlike direct hook tests.
     """
     hooks = sorted(
         decorating_hooks,
@@ -198,7 +202,16 @@ async def simulated_respond(event, *, decorating_hooks=(), after_hooks=()):
     )
     for hook in hooks:
         await hook(event)
-        assert_no_hook_delivery(event)
+        if allow_prefix:
+            if event.clear_count:
+                raise AssertionError("decorating hook must not clear the result")
+            event.stop_event.assert_not_called()
+            for sent in event.send.await_args_list:
+                components = sent.args[0].chain
+                if not components or not all(isinstance(item, Plain) for item in components):
+                    raise AssertionError("prefix sends may contain only nonempty Plain groups")
+        else:
+            assert_no_hook_delivery(event)
     result = event.get_result()
     if result is None or not any(
         not isinstance(component, (At, Reply))
@@ -206,15 +219,21 @@ async def simulated_respond(event, *, decorating_hooks=(), after_hooks=()):
         for component in result.chain
     ):
         return
-    # Only model the successful normal-send path. Empty/header-only replies do
-    # not guarantee an after callback in the real core either.
-    await event.send(MessageChain(chain=list(result.chain)))
+    # Empty/header-only replies do not guarantee an after callback. Conversely,
+    # an ordinary normal-send failure can still be followed by after callbacks.
+    try:
+        await event.send(MessageChain(chain=list(result.chain)))
+    except Exception as error:
+        event.simulated_core_send_error = error
     for hook in after_hooks:
         await hook(event)
 
 
 class PluginFixtures:
+    """Legacy regression fixture explicitly selects the optional core-only mode."""
+
     def make_plugin(self, **config):
+        config.setdefault("send_mode", "core")
         config.setdefault("send_interval", 0)
         context = SimpleNamespace(get_registered_star=Mock(return_value=None))
         plugin = PLUGIN.ReplyFilterPlugin(context, config)
@@ -241,7 +260,7 @@ class PluginFixtures:
 
 
 class PluginTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
-    """Direct hook tests: inspect result.chain, never simulate sending here."""
+    """Core-only hook regressions: inspect result.chain, never simulate sending."""
 
     def test_stub_import_restores_global_module_registry(self):
         for name, module in API_STUBS.items():
@@ -774,7 +793,7 @@ class PluginTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
         self.assert_in_place(first, first_result, first_chain)
         self.assert_in_place(second, second_result, second_chain)
 
-    async def test_legacy_send_interval_is_read_but_does_not_delay_or_send(self):
+    async def test_core_mode_send_interval_is_read_but_does_not_delay_or_send(self):
         plugin = self.make_plugin(send_interval=0.25)
         event = self.event("one,two,three")
         original, chain = event.result, event.result.chain
@@ -784,12 +803,12 @@ class PluginTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
         sleep.assert_not_awaited()
         self.assertEqual(chain, [Plain("one\n"), Plain("two\n"), Plain("three")])
         self.assertFalse(hasattr(plugin, "_session_lock"))
-        self.assertFalse(hasattr(plugin, "_delivery_groups"))
+        self.assertEqual(plugin.settings.send_mode, "core")
         self.assert_in_place(event, original, chain)
 
 
 class SimulatedCoreTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
-    """Compatibility models only; these are not real AstrBot/OneBot delivery."""
+    """Core-only compatibility models, not real AstrBot/OneBot delivery."""
 
     async def test_simulated_normal_send_keeps_short_segments_readable_without_segmentation(self):
         plugin = self.make_plugin()
@@ -917,8 +936,12 @@ class SimulatedCoreTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
         event = self.event("one filtered reply")
         original, chain = event.result, event.result.chain
         event.send.side_effect = RuntimeError("acknowledgement lost")
-        with self.assertRaisesRegex(RuntimeError, "acknowledgement lost"):
-            await simulated_respond(event, decorating_hooks=[plugin.filter_reply])
+        after = AsyncMock()
+        await simulated_respond(event, decorating_hooks=[plugin.filter_reply], after_hooks=[after])
+        self.assertIsInstance(event.simulated_core_send_error, RuntimeError)
+        self.assertEqual(str(event.simulated_core_send_error), "acknowledgement lost")
+        # The real ordinary-error path may still invoke after; not proof of delivery.
+        after.assert_awaited_once_with(event)
         event.send.assert_awaited_once()
         self.assertIs(event.result, original)
         self.assertIs(original.chain, chain)

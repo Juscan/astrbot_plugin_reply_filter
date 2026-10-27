@@ -1,7 +1,7 @@
 name: astrbot_plugin_reply_filter
 display_name: 回复过滤与分段渲染
 desc: 仅处理 OneBot 大模型回复；短文本过滤分段，超过150字或Markdown交给browser插件渲染为图片或PDF。
-version: 1.1.1
+version: 1.1.2
 author: Jusc
 repo: "https://github.com/Juscan/astrbot_plugin_reply_filter"
 support_platforms:

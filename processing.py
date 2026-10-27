@@ -54,7 +54,8 @@ class Settings:
     blocked_words: tuple[str, ...] = ()
     max_segment_length: int = 150
     max_messages: int = 10  # Soft Plain-segment cap; never discard attachments.
-    send_interval: float = 0.6  # Deprecated: core segmented_reply controls sending.
+    send_mode: str = "segments"
+    send_interval: float = 0.6
     render_timeout: float = 30.0
     image_width: int = 960
     font_size: int = 22
@@ -97,6 +98,8 @@ class Settings:
                     raise ValueError(f"{name} 必须是 {low}～{high} 的有限数值")
         if values.get("render_mode", "image") not in ("image", "pdf", "auto"):
             raise ValueError("render_mode 必须为 image、pdf 或 auto")
+        if values.get("send_mode", "segments") not in ("segments", "core"):
+            raise ValueError("send_mode 必须为 segments 或 core")
         if "split_symbols" in values and not isinstance(values["split_symbols"], str):
             raise ValueError("split_symbols 必须是字符串，不是正则表达式")
         if values.get("symbol_filter_mode", "strict") not in ("strict", "natural", "custom"):

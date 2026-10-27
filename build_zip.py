@@ -4,7 +4,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "dist" / "astrbot_plugin_reply_filter-1.1.1.zip"
+OUTPUT = ROOT / "dist" / "astrbot_plugin_reply_filter-1.1.2.zip"
 EXCLUDED = {
     ".git", ".venv", "venv", "__pycache__", ".ruff_cache", ".pytest_cache",
     "dist", "build", ".idea", ".vscode",

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .processing import (
@@ -24,7 +24,7 @@ from .storage import save_pdf
 
 @register(
     "astrbot_plugin_reply_filter", "Jusc",
-    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.1",
+    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.2",
 )
 class ReplyFilterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -49,13 +49,15 @@ class ReplyFilterPlugin(Star):
             )
         return Comp.File(file=str(path), name="模型回复.pdf")
 
-    async def _text_components(self, text: str, kind: str | None) -> list:
+    async def _text_components(self, text: str, kind: str | None, *, core_only: bool = False) -> list:
         if kind is None:
             values = split_short_text(text, self.settings)
-            # Keep paragraph breaks when core segmented replies are disabled.
-            # With core segmentation these are just trailing line breaks.
+            # Only the optional core-only mode needs separators in one chain.
+            # Independent bubbles contain the segment itself, no trailing newline.
             return [
-                Comp.Plain(text=value + ("\n" if index < len(values) - 1 else ""))
+                Comp.Plain(text=value + (
+                    "\n" if (core_only or self.settings.send_mode == "core") and index < len(values) - 1 else ""
+                ))
                 for index, value in enumerate(values)
             ]
         if len(text) <= self.settings.max_render_chars:
@@ -102,15 +104,18 @@ class ReplyFilterPlugin(Star):
             self.settings,
         )
         prepared: list = []
+        core_only = False
         for run in runs:
             if isinstance(run, str):
-                prepared.extend(await self._text_components(run, kind))
+                prepared.extend(await self._text_components(run, kind, core_only=core_only))
             else:
-                # Non-text media, mentions and reply components keep their order.
+                # Never pre-send another plugin's media or move text across it.
+                # Everything from this boundary onward stays with normal core.
+                core_only = True
                 prepared.append(run)
-        return prepared
+        return self._cap_text_segments(prepared, short=kind is None)
 
-    def _cap_text_segments(self, prepared: list) -> list:
+    def _cap_text_segments(self, prepared: list, *, short: bool = False) -> list:
         """Soft-limit Plain segments without moving or discarding attachments."""
         capped: list = []
         text_count = 0
@@ -120,13 +125,62 @@ class ReplyFilterPlugin(Star):
                     text_count >= self.settings.max_messages
                     and capped and isinstance(capped[-1], Comp.Plain)
                 ):
-                    # Short segments already include newlines; fallback chunks
-                    # must concatenate verbatim to preserve Markdown and code.
-                    capped[-1].text += component.text
+                    # Independent short segments need a separator only when
+                    # coalesced. Render-fallback chunks must concatenate verbatim.
+                    separator = (
+                        "\n" if short and self.settings.send_mode == "segments"
+                        and not capped[-1].text.endswith("\n") else ""
+                    )
+                    capped[-1].text += separator + component.text
                     continue
                 text_count += 1
             capped.append(component)
         return capped
+
+    @staticmethod
+    def _delivery_groups(chain: list) -> list[list]:
+        """Split only the leading Plain run; all media belongs to normal core."""
+        leading = 0
+        for component in chain:
+            if not isinstance(component, Comp.Plain):
+                break
+            leading += 1
+        if leading < 2:
+            return [list(chain)] if chain else []
+        return [[component] for component in chain[:leading - 1]] + [list(chain[leading - 1:])]
+
+    async def _send_prefix(self, event: AstrMessageEvent, result, source_chain: list) -> None:
+        """Send early bubbles, leaving the last group for normal core + after."""
+        groups = self._delivery_groups(source_chain)
+        planned = [
+            (group, [component.text if isinstance(component, Comp.Plain) else None for component in group])
+            for group in groups[:-1]
+        ]
+        for group, texts in planned:
+            if event.get_result() is not result or result.chain is not source_chain:
+                return
+            if len(source_chain) < len(group) or any(
+                source_chain[index] is not component
+                or (isinstance(component, Comp.Plain) and component.text != texts[index])
+                for index, component in enumerate(group)
+            ):
+                return
+            # Remove before awaiting: an acknowledgement can fail after OneBot
+            # accepts a message. Never leave an attempted prefix for core retry.
+            message = MessageChain(chain=list(group))
+            del source_chain[:len(group)]
+            try:
+                await event.send(message)
+            except Exception as error:
+                logger.warning(
+                    f"[reply_filter] 分段发送失败：{type(error).__name__}；"
+                    "未自动重试，未尝试的剩余内容交由框架发送",
+                )
+                return
+            if self.settings.send_interval:
+                await asyncio.sleep(self.settings.send_interval)
+        # No final send, clear_result or stop_event: a later meme decorator can
+        # append an image, and RespondStage still owns final delivery and after.
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10000)
     async def request_non_streaming(self, event: AstrMessageEvent) -> None:
@@ -156,7 +210,7 @@ class ReplyFilterPlugin(Star):
             for component in snapshot
         ]
         try:
-            prepared = self._cap_text_segments(await self._prepare(snapshot))
+            prepared = await self._prepare(snapshot)
         except Exception as error:
             # This is a display formatter, not a security boundary. On failure,
             # keep the original result so attachments and later hooks still work.
@@ -177,9 +231,10 @@ class ReplyFilterPlugin(Star):
             # Do not overwrite its edits; append-only attachments are kept below.
             return
         prepared.extend(source_chain[len(snapshot):])
-        # Preserve result identity, LLM metadata and the list itself. Never send,
-        # clear_result or stop here: core RespondStage must run normally so that
-        # later image decorators and after_message_sent meme senders can execute.
-        # Run before the known meme-manager decorator (99999), including when
-        # filtering removes all text and it needs to switch to an image-only reply.
+        # Preserve result identity, LLM metadata and the list itself. In default
+        # segments mode only early groups are sent now; the final group stays for
+        # later meme decorators (99999), normal core delivery and the after hook.
+        # Core-only mode retains every component and never sends from this hook.
         source_chain[:] = prepared
+        if self.settings.send_mode == "segments":
+            await self._send_prefix(event, result, source_chain)

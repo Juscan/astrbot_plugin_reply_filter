@@ -422,7 +422,7 @@ class MarkdownProbeTests(unittest.TestCase):
 
 
 class SymbolModePluginTests(plugin_stubs.PluginFixtures, unittest.IsolatedAsyncioTestCase):
-    """Nine formatting integration cases, not simulated or real core sending."""
+    """Nine core-only formatting cases, not simulated or real core sending."""
 
     def make_plugin(self, **config):
         config.setdefault("symbol_filter_mode", "natural")
