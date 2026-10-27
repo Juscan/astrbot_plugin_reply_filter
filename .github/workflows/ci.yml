@@ -1,0 +1,60 @@
+name: Test and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: source/astrbot_plugin_reply_filter
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        working-directory: source
+        run: python -m pip install -r astrbot_plugin_reply_filter/requirements.txt ruff
+      - name: Lint
+        working-directory: source
+        run: python -m ruff check astrbot_plugin_reply_filter
+      - name: Compile
+        working-directory: source
+        run: python -m compileall -q astrbot_plugin_reply_filter
+      - name: Unit tests (mocked AstrBot and browser)
+        working-directory: source
+        run: python -m unittest discover -s astrbot_plugin_reply_filter/tests -t . -v
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build installable source ZIP
+        run: python build_zip.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: astrbot_plugin_reply_filter
+          path: dist/astrbot_plugin_reply_filter-1.1.2.zip
+          if-no-files-found: error
