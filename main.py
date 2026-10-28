@@ -24,7 +24,7 @@ from .storage import save_pdf
 
 @register(
     "astrbot_plugin_reply_filter", "Jusc",
-    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.2",
+    "OneBot 大模型回复过滤、分段与浏览器图片/PDF渲染", "1.1.3",
 )
 class ReplyFilterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -149,6 +149,30 @@ class ReplyFilterPlugin(Star):
             return [list(chain)] if chain else []
         return [[component] for component in chain[:leading - 1]] + [list(chain[leading - 1:])]
 
+    @staticmethod
+    def _check_cancelled() -> None:
+        # Some services catch CancelledError and return anyway. Do not commit or
+        # send more content if this task still has an outstanding cancel request.
+        task = asyncio.current_task()
+        cancelling = getattr(task, "cancelling", None)
+        if cancelling is not None and cancelling():
+            raise asyncio.CancelledError
+
+    @staticmethod
+    def _discard_cancelled_reply(event: AstrMessageEvent) -> None:
+        # In AstrBot 4.29.3 the decorator catches BaseException, while a STOP
+        # breaks out of nested async generators without explicitly closing them.
+        # Drop this reply without setting STOP so that version can exhaust the
+        # upstream agent and release its session lock after catching cancellation.
+        # The caller must still propagate cancellation, not re-cancel or uncancel.
+        # The existing 4.29.3 agent flag requests cooperative runner shutdown;
+        # it is event-local and does not stop the next message's agent.
+        event.set_extra("agent_stop_requested", True)
+        result = event.get_result()
+        if result is not None:
+            result.chain.clear()
+        event.clear_result()
+
     async def _send_prefix(self, event: AstrMessageEvent, result, source_chain: list) -> None:
         """Send early bubbles, leaving the last group for normal core + after."""
         groups = self._delivery_groups(source_chain)
@@ -157,6 +181,9 @@ class ReplyFilterPlugin(Star):
             for group in groups[:-1]
         ]
         for group, texts in planned:
+            self._check_cancelled()
+            if event.is_stopped():
+                return
             if event.get_result() is not result or result.chain is not source_chain:
                 return
             if len(source_chain) < len(group) or any(
@@ -177,10 +204,14 @@ class ReplyFilterPlugin(Star):
                     "未自动重试，未尝试的剩余内容交由框架发送",
                 )
                 return
+            self._check_cancelled()
+            if event.is_stopped():
+                return
             if self.settings.send_interval:
                 await asyncio.sleep(self.settings.send_interval)
-        # No final send, clear_result or stop_event: a later meme decorator can
-        # append an image, and RespondStage still owns final delivery and after.
+            self._check_cancelled()
+        # No final send, clear_result or stop_event on the normal path: a later
+        # meme decorator can append an image. Core owns final delivery and after.
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10000)
     async def request_non_streaming(self, event: AstrMessageEvent) -> None:
@@ -203,6 +234,21 @@ class ReplyFilterPlugin(Star):
             return
         if not any(isinstance(component, Comp.Plain) for component in result.chain):
             return
+        if event.is_stopped():
+            return
+        try:
+            self._check_cancelled()
+            await self._format_reply(event, result)
+            self._check_cancelled()
+        except asyncio.CancelledError:
+            self._discard_cancelled_reply(event)
+            # Propagate after cleanup; never swallow cancellation in the plugin.
+            # AstrBot 4.29.3 catches it itself, then sees no result and exhausts
+            # the upstream agent instead of sending the stale tail. Frameworks
+            # that propagate cancellation keep their own cancellation semantics.
+            raise
+
+    async def _format_reply(self, event: AstrMessageEvent, result) -> None:
         source_chain = result.chain
         snapshot = list(source_chain)
         text_snapshot = [
@@ -211,6 +257,7 @@ class ReplyFilterPlugin(Star):
         ]
         try:
             prepared = await self._prepare(snapshot)
+            self._check_cancelled()
         except Exception as error:
             # This is a display formatter, not a security boundary. On failure,
             # keep the original result so attachments and later hooks still work.
@@ -218,7 +265,7 @@ class ReplyFilterPlugin(Star):
                 f"[reply_filter] 处理失败：{type(error).__name__}；保留原结果交由框架发送",
             )
             return
-        if event.get_result() is not result:
+        if event.is_stopped() or event.get_result() is not result:
             return
         if result.chain is not source_chain or len(source_chain) < len(snapshot):
             return

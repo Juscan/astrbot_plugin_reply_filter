@@ -2,9 +2,12 @@
 
 No real OneBot/core/browser is run. The pipeline helper deliberately has core
 segmentation OFF: prefix sends come from the hook, the final send from the
-model core, and after callbacks only from that model. Cancellation tests call
-the plugin directly; the real decorator stage may catch BaseException, so they
-must not be read as end-to-end cancellation guarantees or exactly-once delivery.
+model core, and after callbacks only from that model. Direct-hook cancellation
+regressions require the public hook to propagate cancellation, empty and clear the
+result, and request cooperative agent shutdown without STOP or uncancel. Separate
+real-task tests in test_cancellation use a conceptual onion scheduler/agent-lock
+model, not real framework integration or proof of OneBot/exactly-once delivery.
+External STOP behavior and indefinitely noncooperative dependencies are not fixed.
 """
 
 import asyncio
@@ -364,30 +367,62 @@ class SegmentDeliveryTests(stubs.PluginFixtures, unittest.IsolatedAsyncioTestCas
                 self.assertEqual(sum(self.plain_text(group).count("A") for group in self.deliveries(event)), 1)
                 after.assert_awaited_once_with(event)
 
-    async def test_direct_hook_cancel_during_send_propagates_with_attempted_prefix_removed(self):
-        """Plugin-level propagation only; real core catches some cancellations."""
+    async def test_direct_hook_send_cancellation_propagates_and_discards_tail(self):
         plugin = self.make_plugin()
         event = self.event("A,B,C")
         result, chain = event.result, event.result.chain
-        event.send.side_effect = asyncio.CancelledError()
-        with self.assertRaises(asyncio.CancelledError):
-            await plugin.filter_reply(event)
-        self.assertEqual(self.deliveries(event), [[stubs.Plain("A")]])
-        self.assertEqual(chain, [stubs.Plain("B"), stubs.Plain("C")])
-        self.sleep.assert_not_awaited()
-        self.assert_preserved(event, result, chain)
+        entered, release = asyncio.Event(), asyncio.Event()
 
-    async def test_direct_hook_cancel_during_interval_leaves_unattempted_tail(self):
-        """No assertion that AstrBot propagates the cancellation end-to-end."""
+        async def delayed_send(message):
+            entered.set()
+            await release.wait()
+
+        event.send.side_effect = delayed_send
+        task = asyncio.create_task(plugin.filter_reply(event))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            self.assertTrue(task.cancel())
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=2)
+        self.assertTrue(task.cancelled())
+        self.assert_cancelling(task, 1)
+        self.assertEqual(self.deliveries(event), [[stubs.Plain("A")]])
+        self.sleep.assert_not_awaited()
+        self.assert_discarded_reply(event, result, chain)
+
+    async def test_direct_hook_interval_cancellation_propagates_and_discards_tail(self):
         plugin = self.make_plugin()
         event = self.event("A,B,C")
         result, chain = event.result, event.result.chain
-        self.sleep.side_effect = asyncio.CancelledError()
-        with self.assertRaises(asyncio.CancelledError):
-            await plugin.filter_reply(event)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_sleep(seconds):
+            entered.set()
+            await release.wait()
+
+        self.sleep.side_effect = delayed_sleep
+        task = asyncio.create_task(plugin.filter_reply(event))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            self.assertTrue(task.cancel())
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=2)
+        self.assertTrue(task.cancelled())
+        self.assert_cancelling(task, 1)
         self.assertEqual(self.deliveries(event), [[stubs.Plain("A")]])
-        self.assertEqual(chain, [stubs.Plain("B"), stubs.Plain("C")])
-        self.assert_preserved(event, result, chain)
+        self.assert_discarded_reply(event, result, chain)
 
     async def test_concurrent_result_list_prefix_identity_or_text_changes_stop_presends(self):
         for phase in ("send", "sleep"):

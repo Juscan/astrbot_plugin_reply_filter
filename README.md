@@ -6,15 +6,29 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 
 - 仓库：[Juscan/astrbot_plugin_reply_filter](https://github.com/Juscan/astrbot_plugin_reply_filter)
 - 作者：**Jusc**
-- 版本：**1.1.2**；变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+- 版本：**1.1.3**；变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 1.1.2：恢复默认独立气泡与发送间隔
+## 1.1.3：取消本次回复时丢弃旧尾部
+
+用户在 **AstrBot 4.29.3** 中报告：`main.py` 的 `_send_prefix` 在段间 `sleep` 被新消息打断并得到 `CancelledError` 后，出现持续不回复。**这条日志只说明取消发生的位置，不能单凭它证明永久无响应的完整根因。** 已核对精确 `v4.29.3` 源码：结果装饰阶段对每个装饰 hook 捕获 `BaseException`；旧版仅重新抛出取消时，尚未发送的尾部仍在结果中，框架可能继续后续装饰或发送。
+
+1.1.3 在 `filter_reply` 的整个准备（含渲染）、发送与等待过程捕获 `CancelledError`，并以 `_check_cancelled` 的当前任务取消计数检查，防止依赖吞取消后继续提交或发送。`_discard_cancelled_reply(event)` **仅在取消路径**设置 event-local `agent_stop_requested=true`，清空该事件当前结果的 `chain` 并 `event.clear_result()`，随后以 **裸 `raise` 继续传播取消**；插件不主动吞取消，不 `stop_event`、不 `uncancel` / `recancel`，不重试、不启动后台 sender。本次未发送文本与附件一并丢弃，已发出的消息无法撤回。
+
+不调用 `stop_event`，是为了让 **AstrBot 4.29.3 在既有的 `BaseException` 捕获之后**，按正常路径耗尽上游持锁异步生成器，避免以 STOP 提前 `break` 后依赖生成器终结器延迟收尾；这不是对所有框架、锁或服务清理的保证。插件清理后继续传播取消，内部渲染/发送等服务函数也仍传播，不清零任务取消计数；**4.29.3 框架仍会捕获并记录取消**，不能把插件继续 `raise` 当作框架顶层任务一定标记为 cancelled 的保证。`agent_stop_requested` 是已核对的 4.29.3 协作停止 flag，用于避免旧 agent 在工具中间 yield 后继续；它不是稳定公开的 runner API，不保证即时停止运行中的服务或所有第三方 runner。清空结果让按 `None` 检查的后续装饰早退，也不等于保证任何第三方 hook 都不会另建结果。
+
+**外部停止边界：**入口、渲染提交及分段发送处显式检查 `event.is_stopped()`，已停止时不继续提交或发送。若打断插件已经调用 `stop_event()`，清空结果不能撤销 STOP，scheduler 仍可能提前 `break` 并依赖生成器终结器收尾；本插件不会调用 `continue_event()` 撤销其他代码的停止决定。不能据此保证外部 STOP、服务不响应取消或第三方挂起的所有场景均恢复。
+
+**正常路径不清空结果、不停止事件**：仍默认 `segments` 独立气泡、间隔 0.6 秒，最后一段及附件留给后续装饰、核心发送与符合条件的 after，不吞掉正常表情。普通 `Exception` 发送失败仍保留未尝试尾部交核心；这与 `CancelledError` 丢弃旧尾部是两条不同路径。新请求使用独立 event，不应继承旧 event 的协作停止标记；取消路径不设置全局锁或会话禁用标记。
+
+AstrBot 4.29.3 仍可能打印 `CancelledError`；**不能以日志消失作为修复判断，日志本身也不是再次卡死的证据**。真实 OneBot 环境下持续不回复的复现与修复验收仍待完成，也不承诺无条件释放所有锁或取消所有服务。永久无响应的完整原因仍需结合用户实际使用的打断插件、相关开关及打断前后完整日志排查；严重卡住时可临时关闭本插件并重启 AstrBot，保留现场信息，不要暗改核心配置。验证状态见[测试与验证](#测试与验证)。
+
+## 1.1.2 历史新增：恢复默认独立气泡与发送间隔
 
 1.1.1 改为只装饰原结果，避免旧版 `event.send()` 后 `clear_result()` 干扰表情插件；但多气泡依赖额外开启核心分段。1.1.2 恢复第一版的日常使用方式：**默认 `send_mode=segments`，无需开启 AstrBot 核心 `segmented_reply`，普通纯文本短回复每段一个气泡，`send_interval=0.6` 再次控制段间等待。**
 
-为保留附件和后续插件的处理机会，`segments` **只提前发送链首连续 `Plain` 段的前 n−1 段**，每次发送后等待配置间隔；最后一段及其后的全部附件、交错内容仍留在原 LLM 结果及其 `chain` 中，交后续装饰钩子和正常 `RespondStage`。插件不代发图片、表情、文件等附件；遇到前置 `At` / `Reply` / 图片等非 `Plain` 组件，不跨过它们抢发。混链边界后的文本保留换行，但可能合在最后一条，**不是任意交错混链都独立气泡**。
+为保留附件和后续插件的处理机会，正常路径中 `segments` **只提前发送链首连续 `Plain` 段的前 n−1 段**，每次发送后等待配置间隔；最后一段及其后的全部附件、交错内容仍留在原 LLM 结果及其 `chain` 中，交后续装饰钩子和正常 `RespondStage`。插件不代发图片、表情、文件等附件；遇到前置 `At` / `Reply` / 图片等非 `Plain` 组件，不跨过它们抢发。混链边界后的文本保留换行，但可能合在最后一条，**不是任意交错混链都独立气泡**。
 
-插件不 `clear_result` / `stop_event`，不手动调用 after 或替其他插件补发。已核对的 `priority=99999` 表情插件仍可向保留尾部附图，或由核心尾部的 after 流程处理 pending 队列；**这不是对所有插件的兼容保证，也不是实际 OneBot 联调结论。** 可选 `send_mode=core` 保留 1.1.1 的仅原位装饰方式，整链不提前发送；只有这种模式需要可选核心分段配置来获得多个气泡。提前发送的文本段不会再经过后续装饰或核心发送处理，前缀、自动 quote、路径映射及 after 等只可能作用于保留给核心的尾部，详见[发送模式](#发送模式独立气泡与核心兼容)。
+正常路径不 `clear_result` / `stop_event`，不手动调用 after 或替其他插件补发；1.1.3 仅在取消路径清空当前结果链、`clear_result()` 并重新抛出取消，不调用 `stop_event()`。已核对的 `priority=99999` 表情插件仍可向保留尾部附图，或由核心尾部的 after 流程处理 pending 队列；**这不是对所有插件的兼容保证，也不是实际 OneBot 联调结论。** 可选 `send_mode=core` 保留 1.1.1 的仅原位装饰方式，整链不提前发送；只有这种模式需要可选核心分段配置来获得多个气泡。提前发送的文本段不会再经过后续装饰或核心发送处理，前缀、自动 quote、路径映射及 after 等只可能作用于保留给核心的尾部，详见[发送模式](#发送模式独立气泡与核心兼容)。
 
 ## 精细过滤，尤其适合自然聊天（1.1.0 引入）
 
@@ -47,7 +61,7 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 气泡 3：加油 👍🏽
 ```
 
-段间默认等待 0.6 秒；这些是预期文本处理与发送方式示意，不表示已完成 1.1.2 的真实 QQ 验证。
+段间默认等待 0.6 秒；这些是正常路径的预期文本处理与发送方式示意，不表示已完成 1.1.3 的真实 QQ 验证。
 
 ### 自定义与优先级
 
@@ -68,19 +82,20 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 | `**重点**`、标题、列表、表格、代码块等 Markdown | 即使不到 150 字，也渲染 PNG |
 | 配置 `render_mode=pdf` | 需要渲染时，发送 A4 PDF 文件 |
 | 配置 `render_mode=auto` | 需要渲染且超过 3000 字时 PDF，否则 PNG |
-| 图片渲染失败 | 默认尝试 PDF；仍失败则完整文本回退 |
+| 图片渲染普通失败（非取消） | 默认尝试 PDF；仍失败则完整文本回退 |
 
 **顺序很重要：**
 
 1. 只处理 OneBot 的非流式 `LLM_RESULT`，不拦截普通命令回复。
 2. 合并相邻文本组件，移除 `think` / `thinking` / `analysis` 标签及内容、异常控制字符、配置的字面词句。
 3. 按清理后的**整条回复**决定路由：非空白 Unicode 字符数严格大于阈值，或 Markdown 语法树存在格式节点，即进入渲染。标点也计入字数；不是分词后的“词数”。识别出的颜文字不单独触发 Markdown 误判，不影响真实 Markdown 的识别。
-4. 只有短文本才分段、按所选模式去符号。**不能先破坏 Markdown 再渲染。** 独立发送的短文本段不人为添加尾换行；留给核心的混链尾部可用换行分隔。超过文本段软上限时，多出的相邻短段可在尾段用换行合并，不截断内容。渲染失败回退按原文本拼接，不额外插入分隔换行。
-5. 保留原回复中的图片、文件等所有非 `Plain` 对象及顺序，不由本插件提前发送附件。混合消息按各连续文本区分别渲染，因此可能生成多张图；生成的图片/PDF 同样留给核心。
-6. 处理结果原位写回原 LLM 结果。默认 `segments` 只提前发送链首连续 `Plain` 的前 n−1 段，保留最后一段及后续所有组件；链首遇非 `Plain` 就不抢发，不跨附件边界继续提前发送。混链尾部的文本可用换行保留分段，但实际可能同条显示，不强求附件独占气泡。可选 `core` 不提前发送，整链留给后续插件和核心。
-7. 提前发送前，先从原链剔除即将尝试的前缀，防止框架随后重复发送。发送异常或取消不自动重试：OneBot 可能已接受消息，只是确认失败；未尝试的后缀仍留给核心，可能合成一条。失败段也可能未送达，不保证不丢失。遇到并发替换不强行覆写新链，已发送内容无法撤回；不承诺 exactly-once。
+4. 只有短文本才分段、按所选模式去符号。**不能先破坏 Markdown 再渲染。** 独立发送的短文本段不人为添加尾换行；留给核心的混链尾部可用换行分隔。超过文本段软上限时，多出的相邻短段可在尾段用换行合并，不截断内容。普通渲染失败回退按原文本拼接，不额外插入分隔换行；取消不走文本回退。
+5. 正常路径保留原回复中的图片、文件等所有非 `Plain` 对象及顺序，不由本插件提前发送附件。混合消息按各连续文本区分别渲染，因此可能生成多张图；生成的图片/PDF 同样留给核心。
+6. 正常路径将处理结果原位写回原 LLM 结果。默认 `segments` 只提前发送链首连续 `Plain` 的前 n−1 段，保留最后一段及后续所有组件；链首遇非 `Plain` 就不抢发，不跨附件边界继续提前发送。混链尾部的文本可用换行保留分段，但实际可能同条显示，不强求附件独占气泡。可选 `core` 不提前发送，整链留给后续插件和核心。
+7. 提前发送前，先从原链剔除即将尝试的前缀，防止框架随后重复发送。普通 `Exception` 发送失败不自动重试：OneBot 可能已接受消息，只是确认失败；未尝试的后缀仍留给核心，可能合成一条。失败段也可能未送达，不保证不丢失。
+8. `CancelledError` 与普通发送失败分开处理：准备、渲染、发送、等待或任务取消计数检查发现取消时，设置本 event 的 `agent_stop_requested=true`，清空当前结果链并 `clear_result()`，最终输出钩子以裸 `raise` 继续传播取消；不 `stop_event` / `uncancel` / `recancel`，不续发本次旧文本或附件，不重试、不后台续发。内部服务函数仍传播取消；4.29.3 框架按既有逻辑捕获取消并记录日志后，可在结果为 `None` 时继续正常排空管线。正常路径遇到并发替换不强行覆写新链；已发送内容无法撤回，不承诺 exactly-once。
 
-过滤只改变显示内容，不重写模型上下文、数据库历史或其他插件直接发送的消息。未处理的清理/渲染异常会尽量保留原结果交框架，原文可能继续发送；本插件不是内容安全审核器。已经尝试发送的前缀不会因失败而自动回填或重发。
+过滤只改变显示内容，不重写模型上下文、数据库历史或其他插件直接发送的消息。未处理的普通清理/渲染异常会尽量保留原结果交框架，原文可能继续发送；这不包括上述取消丢弃路径，本插件不是内容安全审核器。已经尝试发送的前缀不会因失败而自动回填或重发。
 
 ## 环境要求
 
@@ -97,7 +112,7 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 
 1. 在 AstrBot 插件管理中，先通过 `https://github.com/rytte/astrbot_plugin_browser` 安装并启用浏览器插件，按其文档完成浏览器环境安装。
 2. 安装本插件时，在插件管理页填入 `https://github.com/Juscan/astrbot_plugin_reply_filter`；已有安装则使用插件管理页的更新操作。也可将本目录放到 AstrBot 的 `data/plugins/astrbot_plugin_reply_filter/`。
-3. **升级至 1.1.2 后确认依赖安装成功；从 1.0.0 升级时尤其留意 1.1.0 新增的 `regex`。** 如依赖未自动安装，在 **AstrBot 使用的 Python 环境**安装 [requirements.txt](requirements.txt)：
+3. **升级至 1.1.3 后确认依赖安装成功；从 1.0.0 升级时尤其留意 1.1.0 新增的 `regex`。** 如依赖未自动安装，在 **AstrBot 使用的 Python 环境**安装 [requirements.txt](requirements.txt)：
 
    ```bash
    python -m pip install -r data/plugins/astrbot_plugin_reply_filter/requirements.txt
@@ -108,7 +123,7 @@ AstrBot 的 **OneBot v11 / aiocqhttp** 插件：清理大模型回复，短文�
 6. 默认 `force_non_streaming=true` 会对 OneBot 事件提前请求非流式；若仍出现逐字/逐段抢先发送，请关闭 AstrBot 当前会话/配置的流式输出，并排查其他插件。
 7. 建议关闭核心文本转图（t2i）、TTS、合并转发，以及会替换整条消息链的同类处理，避免二次处理保留尾部或丢失混链附件。核心 t2i 在插件装饰钩子之后执行，可能将整链替换；关闭它不影响本插件自己的 browser 渲染。本插件不会暗改用户的核心配置，也不调用 `result.use_t2i(False)`。仅当选择 `send_mode=core` 且需要多气泡时，才按可选教程开启核心分段。
 
-ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目录，下一层即可看到 [main.py](main.py) 和 [metadata.yaml](metadata.yaml)。1.1.2 的插件包名为 `astrbot_plugin_reply_filter-1.1.2.zip`。
+ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目录，下一层即可看到 [main.py](main.py) 和 [metadata.yaml](metadata.yaml)。1.1.3 的插件包名为 `astrbot_plugin_reply_filter-1.1.3.zip`。
 
 ### 在 AstrBot 配置页启用自然聊天
 
@@ -123,6 +138,8 @@ ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目�
 7. 需要额外规则时，将 `symbol_filter_mode` 改为 `custom`，再填 `custom_keep_symbols` / `custom_remove_symbols` 并保存。例如保留字段填 `,，`，可让中英文逗号留在短文本中且不按逗号分段。两个字段在 `strict` / `natural` 下不起作用。
 
 ### 发送模式：独立气泡与核心兼容
+
+以下描述正常路径；1.1.3 取消路径会设置本 event 的协作停止 flag、清空当前结果链并 `clear_result()` 后重新抛出取消，不调用 `stop_event()`，也不保留旧尾部供继续发送。
 
 | 配置 | 行为与用途 |
 | --- | --- |
@@ -173,10 +190,10 @@ ZIP 安装时，压缩包中应有 `astrbot_plugin_reply_filter/` 这一层目�
 PDF 使用 AstrBot `File` 组件：
 
 - 同机部署时，协议端需要能够读取生成文件的本地路径，或能通过核心提供的文件回调取得文件。
-- 本插件不提前代发附件：`core` 整链、`segments` 保留的全部图片/PDF 都由核心 `RespondStage` 处理，可按核心配置使用 `platform_settings.path_mapping`。segments 提前发送的纯文本不经过该核心路径映射，但不会把 PDF 抢先发走。
+- 正常路径中本插件不提前代发附件：`core` 整链、`segments` 保留的全部图片/PDF 都由核心 `RespondStage` 处理，可按核心配置使用 `platform_settings.path_mapping`。segments 提前发送的纯文本不经过该核心路径映射，但不会把 PDF 抢先发走。取消时本次未发送图片/PDF 随旧尾部一起丢弃，不再交核心续发。
 - 分容器/分主机仍须提供正确的共享文件与可读路径，或正确配置 `callback_api_base` 并确保协议端可访问文件回调 URL。路径映射只负责路径转换，不会自动共享文件，也不保证回调 URL 可达。**跨容器 PDF 方案尚未完成真实环境验证**；仅 PNG 渲染成功不代表 PDF 文件上传成功。
 
-本插件不自动重试发送。OneBot 可能已经接受消息，只是确认超时；重复发送会造成重复消息。segments 发送异常时不重发已尝试的前缀，尚未尝试的后缀留给核心，可能合成一条；失败段也可能未送达，不保证不丢失。核心及适配器仍有各自的发送与异常处理，不承诺无重发或 exactly-once。文本回退针对的是**发送之前的渲染失败**，不是对文件上传失败的盲目重试。
+本插件不自动重试发送。OneBot 可能已经接受消息，只是确认超时；重复发送会造成重复消息。segments 普通 `Exception` 发送失败时不重发已尝试的前缀，尚未尝试的后缀留给核心，可能合成一条；失败段也可能未送达，不保证不丢失。`CancelledError` 路径则设置本 event 的协作停止 flag、清空当前结果链并 `clear_result()`，最终输出钩子重新抛出取消，不 `stop_event`，不保留旧尾部续发。核心及适配器仍有各自的发送与异常处理，不承诺无重发或 exactly-once。文本回退针对的是**发送之前的普通渲染失败**，不是取消后的续发，也不是对文件上传失败的盲目重试。
 
 ## 配置参考
 
@@ -191,7 +208,7 @@ PDF 使用 AstrBot `File` 组件：
 | `long_text_threshold` | `150` | 非空白字符严格大于此值才判长文本 |
 | `render_mode` | `image` | `image` / `pdf` / `auto` |
 | `auto_pdf_threshold` | `3000` | auto 模式严格大于此值改用 PDF |
-| `pdf_on_image_error` | `true` | PNG 渲染失败后再试 PDF |
+| `pdf_on_image_error` | `true` | PNG 普通渲染失败（非取消）后再试 PDF |
 | `split_symbols` | 换行及中英文常用标点 | 逐字符分隔，不是正则；分隔符不发送，保护/保留项优先且不分段 |
 | `strip_symbols` | `true` | 启用所选模式的短文本符号移除；关闭时也不执行自定义删除，但仍分段 |
 | `symbol_filter_mode` | `strict` | `strict` 兼容旧版；`natural` 自然聊天；`custom` 在自然模式上自定义 |
@@ -232,16 +249,18 @@ PDF 使用 AstrBot `File` 组件：
 
 ### 流式与生命周期
 
-- `on_decorating_result(priority=100000)` 只处理 OneBot 非流式 `LLM_RESULT`，保留原结果、LLM 类型、metadata 和非文本对象。默认 segments 只提前发送链首连续 `Plain` 的前 n−1 段，最后一段及其后的附件/交错内容留给核心；core 只原位装饰。两种模式均不清空结果、不停止事件、不代发附件、不手动调用 after 或替其他插件补发。
+- `on_decorating_result(priority=100000)` 只处理 OneBot 非流式 `LLM_RESULT`。正常路径保留原结果、LLM 类型、metadata 和非文本对象；默认 segments 只提前发送链首连续 `Plain` 的前 n−1 段，最后一段及其后的附件/交错内容留给核心，core 只原位装饰。两种模式的**正常路径**均不清空结果、不停止事件、不代发附件、不手动调用 after 或替其他插件补发；**取消路径**则设置本 event 的 `agent_stop_requested=true`，清空当前结果链并 `clear_result()` 后重新抛出取消，放弃本次未发送文本与附件，不 `stop_event`，不手动清零或重新发起任务取消。
 - `100000` 可早于已核对的 `99999` 表情插件装饰处理，但不是通用的“最早优先级”；其他插件可使用更高优先级、改写链或自行发送，不保证所有插件排序或兼容性。正文滤空后后续插件仍可附图；不意味着每个事件必然有图或必然发送。
 - **segments 提前发出的纯文本不经过后续装饰和核心发送；核心前缀、自动 @ / quote、路径映射、同文去重及 after 只可能作用于保留尾部。** core 则按核心实际条件处理整链。最终空链、空白文本或只有 `At` / `Reply` 时，核心仍可能跳过发送与 after；after 触发本身也不等于 OneBot 已确认成功。
 - 原链的 `At` / `Reply` 会保留；链首出现它们或其他非 `Plain` 时不跨过去抢发。因此带前置引用/@ 或交错附件的回复可能由核心合在一条，不保证所有气泡带 @ / 引用或所有混链独立分段。启用核心分段时，核心还可能移动它们，不保证任意原位置。已发送的纯文本不能被后续插件收回、审核或重写；有此需求请使用 core。
-- 插件不自动重试发送异常，也不吞取消；但框架可能捕获异常/取消后继续管线，不可据此保证整个管线停止。尝试前移除前缀、保留未尝试尾部，是避免重复的防护，不保证失败段不丢失，也不是全局 exactly-once 保证；不承诺跨会话严格顺序。
-- 渲染或等待期间若原结果/链已被其他代码替换，不强行覆盖新链；已提前发送的消息无法撤回。核心文本转图、TTS、合并转发等后续转换仍可覆盖保留尾部，建议关闭；本插件不会替用户修改这些配置。
+- 插件不自动重试普通 `Exception` 发送失败，未尝试尾部仍留给核心；`CancelledError` 或任务取消计数检查发现取消则丢弃本次旧尾并重新抛出取消。AstrBot 4.29.3 每个装饰 hook 外层捕获 `BaseException`，仅重新抛出取消不能保证整条管线停止；1.1.3 清理当前结果并设置本 event 的协作停止 flag 后继续传播取消，内部服务函数也仍传播，不清零任务取消计数。4.29.3 框架仍会捕获并记录取消，不能把插件级传播当作框架顶层取消传播或终止所有外部服务的保证。不重试与移除已尝试前缀是避免重复的防护，不保证失败段不丢失，也不是全局 exactly-once 保证；不承诺跨会话严格顺序。
+- 不使用 `stop_event()` 结束本插件的取消路径，以便核心正常耗尽上游异步生成器；但已有的外部 STOP 不会被清空结果撤销，也不会被本插件用 `continue_event()` 撤销，scheduler 仍可能提前退出并依赖终结器收尾。event-local `agent_stop_requested` 只是已核对的 4.29.3 协作停止 flag，不是稳定公开 runner API；不能保证第三方 runner、挂起插件或不响应取消的服务都恢复。
+- 正常路径在渲染或等待期间若原结果/链已被其他代码替换，不强行覆盖新链；取消路径会清空该事件当前结果链并 `clear_result()`。已提前发送的消息无法撤回。核心文本转图、TTS、合并转发等后续转换仍可覆盖正常保留尾部，建议关闭；本插件不会替用户修改这些配置。
+- 新请求使用独立 event；不得将旧请求的取消/停止状态沿用到新请求。`CancelledError` 日志仍可能出现，不以日志消失判断恢复，也不承诺无条件释放所有锁。持续卡住需记录打断插件、相关开关和前后完整日志；可临时关闭本插件并重启 AstrBot 排查，不暗改核心配置。
 - AstrBot 的 `STREAMING_RESULT` 会绕过该钩子；`STREAMING_FINISH` 时消息已经发出。本插件不假装能收回已经发送的内容。
 - 默认使用高优先级普通消息监听器提前请求非流式。这依赖当前 AstrBot 的 event extra 约定；其他插件仍可覆盖，**Live Mode 不支持**，不能保证所有第三方 runner 的流式行为。
 - 普通监听器不调用 `send`、不设置回复、也不停止事件，不主动让未唤醒的群消息触发 LLM；但它会让这类 OneBot 消息多进入部分事件处理管线。
-- 每一个 `LLM_RESULT` 独立处理；工具调用前后的多个模型回复不会因为一个事件级“处理过”标记而丢失。
+- 正常路径中每一个 `LLM_RESULT` 独立处理；工具调用前后的多个模型回复不会因为一个事件级“处理过”标记而丢失。取消时则协作停止本 event 的旧 agent，不续发旧结果。
 
 ### Markdown 与网络
 
@@ -249,7 +268,7 @@ PDF 使用 AstrBot `File` 组件：
 
 Markdown 转 HTML 时禁用原始 HTML，浏览器 JavaScript 关闭，并使用 CSP 禁止远程资源。Markdown 图片变成替代文字占位，不下载模型提供的图片地址、内网地址或本地文件。链接保留为可读/可点击文本，但渲染不打开目标。
 
-本插件**不是内容安全审核器**。过滤思考块是显示清理，不是通用防泄漏机制；`blocked_words` 也不是敏感内容审核器。清理/渲染阶段未处理异常时，原文可能继续由框架发送，不提供 fail-closed 内容拦截。严格模式去符号会改变运算式或表情语义；自然模式和有限颜文字启发式也不是所有文本的无损转换。需要精确保留时请关闭 `strip_symbols`，并检查分段和保护配置。
+本插件**不是内容安全审核器**。过滤思考块是显示清理，不是通用防泄漏机制；`blocked_words` 也不是敏感内容审核器。清理/渲染阶段未处理的普通异常发生时，原文可能继续由框架发送，不提供 fail-closed 内容拦截；`CancelledError` 的旧尾丢弃仅服务于取消生命周期，不是内容审核。严格模式去符号会改变运算式或表情语义；自然模式和有限颜文字启发式也不是所有文本的无损转换。需要精确保留时请关闭 `strip_symbols`，并检查分段和保护配置。
 
 ### 缓存与限额
 
@@ -262,6 +281,8 @@ PDF 缓存在 `data/plugin_data/astrbot_plugin_reply_filter/pdf/`，文件名使
 ## 接口依据
 
 - [AstrBot 输出钩子文档](https://docs.astrbot.app/dev/star/event-listener.html)
+- [AstrBot v4.29.3 结果装饰阶段：精确 tag 源码](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.3/astrbot/core/pipeline/result_decorate/stage.py)（已核对每个装饰 hook 的 `BaseException` 捕获；不代表真实部署验收）
+- [AstrBot v4.29.3 scheduler：精确 tag 源码](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.3/astrbot/core/pipeline/scheduler.py)（已核对；不代表永久无响应根因已完整确定）
 - [AstrBot 结果装饰管线：固定源码](https://github.com/AstrBotDevs/AstrBot/blob/dad255c60f7983fd63c7c0282ded1dde859fbc9a/astrbot/core/pipeline/result_decorate/stage.py)
 - [AstrBot 正常发送与 after 钩子：固定源码](https://github.com/AstrBotDevs/AstrBot/blob/dad255c60f7983fd63c7c0282ded1dde859fbc9a/astrbot/core/pipeline/respond/stage.py)
 - [代表性表情包管理插件的装饰与发送后补图逻辑](https://github.com/anka-afk/astrbot_plugin_meme_manager/blob/d0843c16eac11b19d1ca64a394749ee13fc93805/mixins/event_handlers.py#L1470-L1668)（源码核对，不等于对用户部署完成联调）

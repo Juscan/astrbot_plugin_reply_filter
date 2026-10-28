@@ -159,8 +159,17 @@ class FakeEvent:
         self.unified_msg_origin = session
         self.extras = {}
         self.clear_count = 0
+        self.clear_result = Mock(side_effect=self._clear_result)
         self.send = AsyncMock()
-        self.stop_event = Mock()
+        self.stopped = False
+        # Preserve Mock assertions while making STOP observable by later stages.
+        self.stop_event = Mock(side_effect=self._stop)
+
+    def _stop(self):
+        self.stopped = True
+
+    def is_stopped(self):
+        return self.stopped
 
     def get_platform_name(self):
         return self.platform
@@ -168,7 +177,7 @@ class FakeEvent:
     def get_result(self):
         return self.result
 
-    def clear_result(self):
+    def _clear_result(self):
         self.clear_count += 1
         self.result = None
 
@@ -249,6 +258,24 @@ class PluginFixtures:
     @staticmethod
     def plain_text(chain):
         return "".join(component.text for component in chain if isinstance(component, Plain))
+
+    def assert_cancelling(self, task, count):
+        # Task.cancelling() was added in Python 3.11; real cancel tests also run
+        # on the plugin's older supported interpreters without that diagnostic.
+        if hasattr(task, "cancelling"):
+            self.assertEqual(task.cancelling(), count)
+
+    def assert_discarded_reply(self, event, original_result, original_chain):
+        """Cancellation drops this reply but must allow upstream normal cleanup."""
+        self.assertIsNone(event.get_result())
+        self.assertIs(original_result.chain, original_chain)
+        self.assertEqual(original_chain, [])
+        self.assertIs(original_result.result_content_type, LLM_MARKER)
+        self.assertFalse(event.is_stopped())
+        event.stop_event.assert_not_called()
+        event.clear_result.assert_called_once_with()
+        self.assertEqual(event.clear_count, 1)
+        self.assertIs(event.extras.get("agent_stop_requested"), True)
 
     def assert_in_place(self, event, original_result, original_chain):
         self.assertIs(event.result, original_result)
@@ -689,11 +716,10 @@ class PluginTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(a is b for a, b in zip(chain[2:], appended)))
         self.assert_in_place(event, original, chain)
 
-    async def test_cancellation_during_prepare_propagates_and_preserves_original_result(self):
+    async def test_prepare_cancellation_propagates_after_discarding_reply(self):
         plugin = self.make_plugin()
         event = self.event("one,two")
         original, chain = event.result, event.result.chain
-        before = chain.copy()
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def wait_forever(snapshot):
@@ -705,33 +731,52 @@ class PluginTests(PluginFixtures, unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(plugin.filter_reply(event))
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
-            task.cancel()
+            self.assertTrue(task.cancel())
             with self.assertRaises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, timeout=2)
         finally:
             release.set()
             if not task.done():
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
-                    await task
-        self.assertEqual(chain, before)
-        self.assertIs(chain[0], before[0])
-        self.assert_in_place(event, original, chain)
+                    await asyncio.wait_for(task, timeout=2)
+        self.assertTrue(task.cancelled())
+        self.assert_cancelling(task, 1)
+        self.assert_discarded_reply(event, original, chain)
+        event.send.assert_not_awaited()
 
-    async def test_render_cancellation_is_not_swallowed_or_converted_to_text_fallback(self):
+    async def test_render_cancellation_propagates_without_text_fallback(self):
         plugin = self.make_plugin()
-        event = self.event("**must remain original on cancellation**")
+        source = "**cancelled render must not fall back**"
+        event = self.event(source)
         original, chain = event.result, event.result.chain
-        before = chain.copy()
-        plugin.renderer.render.side_effect = asyncio.CancelledError()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_render(text, kind):
+            entered.set()
+            await release.wait()
+            return PNG
+
+        plugin.renderer.render.side_effect = delayed_render
         with patch.object(PLUGIN.logger, "warning") as warning:
-            with self.assertRaises(asyncio.CancelledError):
-                await plugin.filter_reply(event)
-        plugin.renderer.render.assert_awaited_once_with(before[0].text, "image")
+            task = asyncio.create_task(plugin.filter_reply(event))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                self.assertTrue(task.cancel())
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=2)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=2)
+        self.assertTrue(task.cancelled())
+        self.assert_cancelling(task, 1)
+        plugin.renderer.render.assert_awaited_once_with(source, "image")
         warning.assert_not_called()
-        self.assertEqual(chain, before)
-        self.assertIs(chain[0], before[0])
-        self.assert_in_place(event, original, chain)
+        self.assert_discarded_reply(event, original, chain)
+        event.send.assert_not_awaited()
 
     async def test_same_and_different_session_events_can_prepare_concurrently(self):
         for second_session in ("same-session", "different-session"):
